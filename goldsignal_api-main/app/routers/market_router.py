@@ -205,12 +205,13 @@ def get_settings(symbol: str = "GC=F", user: models.User = Depends(auth.get_curr
 
 
 class AnchorBody(BaseModel):
-    anchor: Literal["ny_close", "utc"]
+    anchor: Literal["ny_close", "utc", "fixed"]
+    offset: float | None = None
 
 
 @router.post("/anchor")
 def set_anchor(body: AnchorBody, symbol: str = "GC=F", user: models.User = Depends(auth.get_current_user)):
-    settings.set_anchor(body.anchor)
+    settings.set_anchor(body.anchor, body.offset)
     return _mt5_state(symbol)
 
 

@@ -58,6 +58,15 @@ def list_orders(limit: int = Query(40, ge=1, le=200), db: Session = Depends(get_
     return {"orders": [bridge.order_out(o) for o in rows]}
 
 
+@router.post("/clock/sync")
+def clock_sync(db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
+    """Align the app's candle clock (4H / 1D cut + 'MT5 server' display) with the broker offset the EA reported."""
+    r = bridge.sync_clock(db, user)
+    if not r.get("ok"):
+        raise HTTPException(400, r["error"])
+    return {**r, **bridge.view(db, user)}
+
+
 @router.post("/orders/{order_id}/{action}")
 def order_action(order_id: int, action: str, db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
     if action not in ("send", "skip", "cancel", "close"):
@@ -114,11 +123,15 @@ def ea_row(x_bridge_token: str | None = Header(default=None), db: Session = Depe
 class PollBody(BaseModel):
     version: Optional[str] = None
     account: Optional[dict] = None
+    positions: Optional[List[dict]] = None       # every open position of the terminal (id parsed from the GS#<id> comment)
+    live: Optional[dict] = None                  # {broker_symbol: {bid, ask, spread, m1: [[t,o,h,l,c,v], ...]}}
+    server_time: Optional[float] = None          # TimeCurrent(): the terminal's last tick, broker clock
+    gmt_time: Optional[float] = None             # TimeGMT(): the VPS clock as the terminal sees it
 
 
 @router.post("/ea/poll", response_class=PlainTextResponse)
 def ea_poll(body: PollBody, row: models.BridgeSetting = Depends(ea_row), db: Session = Depends(get_db)):
-    return PlainTextResponse(bridge.poll(db, row, body.account, body.version))
+    return PlainTextResponse(bridge.poll(db, row, body.account, body.version, body.positions, body.live, body.server_time, body.gmt_time))
 
 
 class ReportBody(BaseModel):
@@ -141,6 +154,7 @@ class CandlesBody(BaseModel):
     tf: str                           # 1m 5m 15m 30m 1h 1d
     tz_offset_hours: float = 0.0      # broker server time minus UTC, in hours (GMT+3 -> 3)
     rows: List[List[float]]           # [time, open, high, low, close, volume]  (time = MT5 server-time epoch seconds)
+    server_time: Optional[float] = None   # TimeCurrent(): lets the server work out the real broker offset itself
 
 
 @router.post("/ea/candles")
@@ -162,7 +176,10 @@ def ea_candles(body: CandlesBody, row: models.BridgeSetting = Depends(ea_row)):
     a = np.asarray([r[:6] + [0.0] * (6 - len(r)) for r in body.rows], dtype=float)
     off = settings_mod.offset(sym)
     step = candle_store.STEP[body.tf]
-    ts = a[:, 0] - body.tz_offset_hours * 3600.0
+    from .. import live_feed
+    detected = live_feed.detect_offset(body.server_time) if body.server_time else None
+    tz = detected if detected is not None else (live_feed.clock().get("server_offset", body.tz_offset_hours))
+    ts = a[:, 0] - tz * 3600.0
     df = pd.DataFrame({"Open": a[:, 1] - off, "High": a[:, 2] - off, "Low": a[:, 3] - off, "Close": a[:, 4] - off, "Volume": a[:, 5]},
                       index=pd.to_datetime(ts, unit="s", utc=True))
     df.index.name = "time"

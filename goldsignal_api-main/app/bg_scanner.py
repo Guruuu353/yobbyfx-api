@@ -43,7 +43,10 @@ _last_collect = 0.0
 STATUS: dict = {"last_tick": None, "scans": 0, "expert_pairs": 0, "errors": 0, "last_error": None}
 
 
-def _due(key: tuple, step: int, expert: bool, now: float) -> bool:
+EARLY_SECONDS = max(5, int(os.environ.get("GOLDSIGNAL_EARLY_SECONDS", "10")))   # early-entry pairs: brain re-read this often
+
+
+def _due(key: tuple, step: int, expert: bool, now: float, early: bool = False) -> bool:
     last = _last.get(key)
     if last is None:
         return True
@@ -52,7 +55,7 @@ def _due(key: tuple, step: int, expert: bool, now: float) -> bool:
         if since_close < FAST_WINDOW:                              # just after a candle close: a trigger may have printed
             new_candle = int(now // step) != int(last // step)
             return since_close >= 2 and (new_candle or now - last >= FAST_EVERY)   # 2 s grace for the feed to publish the candle
-        return now - last >= EXPERT_SECONDS
+        return now - last >= (EARLY_SECONDS if early else EXPERT_SECONDS)
     return now - last >= INTERVAL
 
 
@@ -86,7 +89,7 @@ def tick(force: bool = False) -> int:
         for t in targets:
             step = INTERVAL_SECONDS.get(t["entry_tf"], 900)
             key = (t["user_id"], t["symbol"], t["entry_tf"])
-            if not force and not _due(key, step, t["expert"], now):
+            if not force and not _due(key, step, t["expert"], now, bool(t.get("early"))):
                 continue
             if not sessions.market_open(None, is_futures(t["symbol"])):
                 _last[key] = now                          # weekend / daily break: nothing can happen, spare the feed

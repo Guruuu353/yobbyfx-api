@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|  GoldSignalBridge.mq5  -  version 1.0                             |
+//|  GoldSignalBridge.mq5  -  version 2.0                             |
 //|  Places the signals from your GoldSignal app in this MT5 terminal |
 //|                                                                    |
 //|  HOW IT WORKS                                                      |
@@ -19,22 +19,34 @@
 //|    3. Drag "GoldSignalBridge" onto ANY chart, press the            |
 //|       "Algo Trading" button so it is green.  Done: the app's       |
 //|       Expert card turns to "Connected".                            |
+//|  NEW IN 2.0                                                        |
+//|    * LIVE FEED: pushes this terminal's live quote + 1-minute       |
+//|      candles to the app every ~2 s, so the engine no longer waits  |
+//|      for Yahoo's delayed data.                                     |
+//|    * Sends balance, equity, margin and every open position.        |
+//|    * Executes MODIFY (trailing / break-even from the app) and      |
+//|      CLOSE (brain flipped, news guard, early trade not confirmed). |
+//|    * Keeps retrying an order locally until it is placed or expires |
+//|      and tells the app WHY it is waiting (spread, AutoTrading...). |
+//|    * Reports the broker clock so chart times match your MT5.       |
 //|    The EA refuses REAL accounts unless you also tick               |
 //|    InpAllowLiveAccount below AND untick "Demo only" in the app.    |
 //+------------------------------------------------------------------+
 #property copyright "GoldSignal"
-#property version   "1.00"
+#property version   "2.00"
 #property description "GoldSignal MT5 bridge - executes the signals approved in the app"
 
 #include <Trade\Trade.mqh>
 
-#define GS_VERSION "1.0"
+#define GS_VERSION "2.0"
 
 input string InpToken            = "__TOKEN__";     // Bridge token (already filled in by the app)
 input string InpApiUrl           = "__API_URL__";   // Your GoldSignal backend address
 input bool   InpAllowLiveAccount = false;           // Allow trading on a REAL account (default: demo only)
 input bool   InpUploadHistory    = true;            // Send this terminal's candle history to the app (brain learns from it)
 input int    InpHistoryBars      = 30000;           // Candles per pair and timeframe to send the first time
+input bool   InpLiveFeed         = true;            // Push live quotes + 1m candles to the app (kills the data lag)
+input int    InpPollSeconds      = 2;               // How often to talk to the app
 
 CTrade   g_trade;
 string   g_cfgKeys[];
@@ -52,6 +64,14 @@ int             g_hIdx   = 0;
 int             g_hOff   = 0;
 int             g_hWant  = 0;
 int             g_hFails = 0;
+
+// orders handed to us that are not placed yet (retried locally every second until they expire)
+string   g_pLine[];
+long     g_pId[];
+string   g_pMsg[];
+ulong    g_pLastMs[];
+bool     g_liveSynced[];                // per allowed pair: has the first big batch of 1m candles gone out?
+string   g_liveSyms[];
 
 // positions opened by this EA that we still have to report as closed
 long     g_trkId[];
@@ -106,7 +126,7 @@ int Post(string path, string body, string &response)
    if(len > 0)
       ArrayResize(data, len - 1);        // drop the terminating zero
    ResetLastError();
-   int code = WebRequest("POST", ServerBase() + path, headers, 8000, data, result, resHeaders);
+   int code = WebRequest("POST", ServerBase() + path, headers, 5000, data, result, resHeaders);
    if(code == -1)
    {
       int err = GetLastError();
@@ -137,7 +157,10 @@ string AccountJson()
    s += "\"currency\":\"" + JsonEsc(AccountInfoString(ACCOUNT_CURRENCY)) + "\",";
    s += "\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
    s += "\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + ",";
+   s += "\"margin\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2) + ",";
    s += "\"margin_free\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) + ",";
+   s += "\"margin_level\":" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL), 1) + ",";
+   s += "\"profit\":" + DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2) + ",";
    s += "\"leverage\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LEVERAGE)) + ",";
    s += "\"trade_mode\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_TRADE_MODE)) + ",";
    s += "\"demo\":" + (real ? "false" : "true") + ",";
@@ -170,6 +193,112 @@ void Report(long id, string ev, ulong ticket, double price, double lots, double 
 string Tag(long id)
 {
    return "GS#" + IntegerToString(id);
+}
+
+//+------------------------------------------------------------------+
+//| snapshot of everything open in the terminal                       |
+//+------------------------------------------------------------------+
+long IdFromComment(string c)
+{
+   if(StringFind(c, "GS#") != 0)
+      return 0;
+   string rest = StringSubstr(c, 3);
+   int sp = StringFind(rest, " ");
+   if(sp > 0)
+      rest = StringSubstr(rest, 0, sp);
+   return StringToInteger(rest);
+}
+
+string PositionsJson()
+{
+   string s = "[";
+   int total = PositionsTotal();
+   int n = 0;
+   for(int i = 0; i < total && n < 60; i++)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      string c = PositionGetString(POSITION_COMMENT);
+      if(n > 0)
+         s += ",";
+      s += "{\"ticket\":" + IntegerToString((long)tk) + ",\"id\":" + IntegerToString(IdFromComment(c)) +
+           ",\"symbol\":\"" + JsonEsc(sym) + "\",\"type\":\"" + (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL") + "\"" +
+           ",\"volume\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) +
+           ",\"open\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits) +
+           ",\"sl\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits) +
+           ",\"tp\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits) +
+           ",\"price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_CURRENT), digits) +
+           ",\"profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP), 2) +
+           ",\"time\":" + IntegerToString((long)PositionGetInteger(POSITION_TIME)) +
+           ",\"comment\":\"" + JsonEsc(c) + "\"}";
+      n++;
+   }
+   return s + "]";
+}
+
+//+------------------------------------------------------------------+
+//| live quote + 1-minute candles of the allowed pairs                |
+//+------------------------------------------------------------------+
+string LiveJson()
+{
+   string list = CfgGet("pairs", "");
+   if(!InpLiveFeed || list == "")
+      return "";
+   string syms[];
+   int n = StringSplit(list, ',', syms);
+   if(ArraySize(g_liveSyms) != n)               // pairs changed in the app: start the first-batch logic again
+   {
+      ArrayResize(g_liveSyms, n);
+      ArrayResize(g_liveSynced, n);
+      for(int i = 0; i < n; i++)
+      {
+         g_liveSyms[i] = syms[i];
+         g_liveSynced[i] = false;
+      }
+   }
+   string out = "{";
+   int used = 0;
+   for(int i = 0; i < n; i++)
+   {
+      string sym = syms[i];
+      if(sym == "" || !SymbolSelect(sym, true))
+         continue;
+      double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+      double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+      if(bid <= 0 || ask <= 0)
+         continue;
+      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      int want = g_liveSynced[i] ? 6 : 400;    // forming bar + a few closed ones; the first time a bigger batch fills the gap
+      MqlRates r[];
+      int got = CopyRates(sym, PERIOD_M1, 0, want, r);
+      if(got <= 0)
+         continue;
+      if(used > 0)
+         out += ",";
+      long tickAge = (long)TimeCurrent() - (long)SymbolInfoInteger(sym, SYMBOL_TIME);
+      out += "\"" + JsonEsc(sym) + "\":{\"bid\":" + DoubleToString(bid, digits) + ",\"ask\":" + DoubleToString(ask, digits) +
+             ",\"spread\":" + IntegerToString((long)SymbolInfoInteger(sym, SYMBOL_SPREAD)) + ",\"age\":" + IntegerToString(tickAge) + ",\"m1\":[";
+      for(int k = 0; k < got; k++)
+      {
+         if(k > 0)
+            out += ",";
+         out += "[" + IntegerToString((long)r[k].time) + "," + DoubleToString(r[k].open, digits) + "," + DoubleToString(r[k].high, digits) + "," +
+                DoubleToString(r[k].low, digits) + "," + DoubleToString(r[k].close, digits) + "," + IntegerToString((long)r[k].tick_volume) + "]";
+      }
+      out += "]}";
+      used++;
+   }
+   out += "}";
+   return used > 0 ? out : "";
+}
+
+void LiveMarkSynced()
+{
+   for(int i = 0; i < ArraySize(g_liveSynced); i++)
+      g_liveSynced[i] = true;
 }
 
 //+------------------------------------------------------------------+
@@ -486,6 +615,112 @@ void ExecuteClose(string &p[])
 }
 
 //+------------------------------------------------------------------+
+//| MODIFY from the app: trailing stop, break-even, aligned levels    |
+//+------------------------------------------------------------------+
+void ExecuteModify(string &p[])
+{
+   // MODIFY|id|ticket|sl|tp      (0 = leave that level alone)
+   if(ArraySize(p) < 5)
+      return;
+   long   id    = StringToInteger(p[1]);
+   double newSl = StringToDouble(p[3]);
+   double newTp = StringToDouble(p[4]);
+   long   magic = (long)CfgNum("magic", 770011);
+   ulong  tk    = FindPositionByTag(id, magic);
+   if(tk == 0 || !PositionSelectByTicket(tk))
+      return;
+   string sym    = PositionGetString(POSITION_SYMBOL);
+   int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double point  = SymbolInfoDouble(sym, SYMBOL_POINT);
+   bool   isBuy  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+   double curSl  = PositionGetDouble(POSITION_SL);
+   double curTp  = PositionGetDouble(POSITION_TP);
+   double bid    = SymbolInfoDouble(sym, SYMBOL_BID);
+   double ask    = SymbolInfoDouble(sym, SYMBOL_ASK);
+   double stopsLevel = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+   newSl = newSl > 0 ? NormalizeDouble(newSl, digits) : curSl;
+   newTp = newTp > 0 ? NormalizeDouble(newTp, digits) : curTp;
+   if(MathAbs(newSl - curSl) < point * 0.5 && MathAbs(newTp - curTp) < point * 0.5)
+      return;                                         // nothing to change
+   if(newSl > 0 && ((isBuy && newSl >= bid - stopsLevel) || (!isBuy && newSl <= ask + stopsLevel)))
+   {
+      g_status = sym + ": stop " + DoubleToString(newSl, digits) + " is too close to the price, will retry";
+      return;                                         // the app asks again on the next polls
+   }
+   g_trade.SetExpertMagicNumber((ulong)magic);
+   if(g_trade.PositionModify(tk, newSl, newTp))
+   {
+      Report(id, "modified", tk, newSl, 0, 0, "Stop moved to " + DoubleToString(newSl, digits));
+      g_status = sym + ": stop moved to " + DoubleToString(newSl, digits);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| orders waiting to be placed: retried here every second            |
+//+------------------------------------------------------------------+
+int PendFind(long id)
+{
+   for(int i = 0; i < ArraySize(g_pId); i++)
+      if(g_pId[i] == id)
+         return i;
+   return -1;
+}
+
+void PendAdd(string line, long id)
+{
+   int n = ArraySize(g_pId);
+   ArrayResize(g_pLine, n + 1);
+   ArrayResize(g_pId, n + 1);
+   ArrayResize(g_pMsg, n + 1);
+   ArrayResize(g_pLastMs, n + 1);
+   g_pLine[n] = line;
+   g_pId[n] = id;
+   g_pMsg[n] = "";
+   g_pLastMs[n] = 0;
+}
+
+void PendRemove(int idx)
+{
+   int n = ArraySize(g_pId);
+   for(int i = idx; i < n - 1; i++)
+   {
+      g_pLine[i] = g_pLine[i + 1];
+      g_pId[i] = g_pId[i + 1];
+      g_pMsg[i] = g_pMsg[i + 1];
+      g_pLastMs[i] = g_pLastMs[i + 1];
+   }
+   ArrayResize(g_pLine, n - 1);
+   ArrayResize(g_pId, n - 1);
+   ArrayResize(g_pMsg, n - 1);
+   ArrayResize(g_pLastMs, n - 1);
+}
+
+void ProcessPending()
+{
+   for(int i = ArraySize(g_pId) - 1; i >= 0; i--)
+   {
+      string p[];
+      StringSplit(g_pLine[i], '|', p);
+      g_status = "";
+      bool handled = ExecuteOpen(p);
+      if(handled)
+      {
+         PendRemove(i);
+         continue;
+      }
+      // still waiting: tell the app why (when the reason changes, or every 20 s)
+      ulong nowMs = GetTickCount64();
+      string why = g_status == "" ? "waiting for a quote" : g_status;
+      if(why != g_pMsg[i] || nowMs - g_pLastMs[i] > 20000)
+      {
+         Report(g_pId[i], "pending", 0, 0, 0, 0, why);
+         g_pMsg[i] = why;
+         g_pLastMs[i] = nowMs;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| break-even (done here, on live prices, not on the app's candles)  |
 //+------------------------------------------------------------------+
 void ManageBreakEven()
@@ -634,7 +869,12 @@ void BuildHistoryQueue()
 
 void Poll()
 {
-   string body = "{\"version\":\"" + GS_VERSION + "\",\"account\":" + AccountJson() + "}";
+   string body = "{\"version\":\"" + GS_VERSION + "\",\"account\":" + AccountJson() + ",\"positions\":" + PositionsJson() +
+                 ",\"server_time\":" + IntegerToString((long)TimeCurrent()) + ",\"gmt_time\":" + IntegerToString((long)TimeGMT());
+   string lj = LiveJson();
+   if(lj != "")
+      body += ",\"live\":" + lj;
+   body += "}";
    string resp;
    int code = Post("/bridge/ea/poll", body, resp);
    if(code == 401)
@@ -648,11 +888,15 @@ void Poll()
          g_status = "server answered HTTP " + IntegerToString(code);
       return;
    }
+   if(lj != "")
+      LiveMarkSynced();
    string lines[];
    int n = StringSplit(resp, '\n', lines);
    string openLines[];
+   string modLines[];
    string closeLines[];
    ArrayResize(openLines, 0);
+   ArrayResize(modLines, 0);
    ArrayResize(closeLines, 0);
    for(int i = 0; i < n; i++)
    {
@@ -668,6 +912,12 @@ void Poll()
          ArrayResize(openLines, k + 1);
          openLines[k] = ln;
       }
+      else if(StringFind(ln, "MODIFY|") == 0)
+      {
+         int k = ArraySize(modLines);
+         ArrayResize(modLines, k + 1);
+         modLines[k] = ln;
+      }
       else if(StringFind(ln, "CLOSE|") == 0)
       {
          int k = ArraySize(closeLines);
@@ -675,14 +925,27 @@ void Poll()
          closeLines[k] = ln;
       }
    }
-   g_status = "connected, mode " + CfgGet("mode", "?");
+   g_status = "connected, mode " + CfgGet("mode", "?") + (lj != "" ? ", live feed on" : "");
    if(InpUploadHistory && !g_historyBuilt && ArraySize(g_cfgKeys) > 0)
       BuildHistoryQueue();
    for(int i = 0; i < ArraySize(openLines); i++)
    {
       string p[];
       StringSplit(openLines[i], '|', p);
-      ExecuteOpen(p);
+      if(ArraySize(p) < 2)
+         continue;
+      long id = StringToInteger(p[1]);
+      if(GlobalVariableCheck("GSB_DONE_" + IntegerToString(id)))
+         continue;
+      if(PendFind(id) < 0)
+         PendAdd(openLines[i], id);
+   }
+   ProcessPending();
+   for(int i = 0; i < ArraySize(modLines); i++)
+   {
+      string p[];
+      StringSplit(modLines[i], '|', p);
+      ExecuteModify(p);
    }
    for(int i = 0; i < ArraySize(closeLines); i++)
    {
@@ -744,9 +1007,13 @@ void UploadStep()
    }
    g_hFails = 0;
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   double off = (double)((long)TimeTradeServer() - (long)TimeGMT()) / 3600.0;
-   off = MathRound(off * 2.0) / 2.0;                           // broker server time minus UTC, in hours
-   string b = "{\"symbol\":\"" + JsonEsc(sym) + "\",\"tf\":\"" + g_hTfName[g_hIdx] + "\",\"tz_offset_hours\":" + DoubleToString(off, 1) + ",\"rows\":[";
+   double off = CfgNum("server_offset", -99.0);                // the app works the broker offset out itself (independent of this PC's clock)
+   if(off < -50.0)
+   {
+      off = (double)((long)TimeTradeServer() - (long)TimeGMT()) / 3600.0;
+      off = MathRound(off * 2.0) / 2.0;                        // fallback: broker server time minus UTC, in hours
+   }
+   string b = "{\"symbol\":\"" + JsonEsc(sym) + "\",\"tf\":\"" + g_hTfName[g_hIdx] + "\",\"tz_offset_hours\":" + DoubleToString(off, 1) + ",\"server_time\":" + IntegerToString((long)TimeCurrent()) + ",\"rows\":[";
    for(int i = 0; i < got; i++)
    {
       if(i > 0)
@@ -819,14 +1086,15 @@ void OnDeinit(const int reason)
 void OnTimer()
 {
    ulong now = GetTickCount64();
-   if(now - g_lastPollMs >= 3000)
+   if(now - g_lastPollMs >= (ulong)MathMax(1, InpPollSeconds) * 1000)
    {
       g_lastPollMs = now;
       Poll();
    }
+   ProcessPending();                                    // an order that could not be placed yet is retried every second
    ManageBreakEven();
    CheckClosed();
-   if(now - g_lastPollMs >= 900)                        // history goes out between polls, one chunk at a time
+   if(now - g_lastPollMs >= 900 && ArraySize(g_pId) == 0)   // history goes out between polls, one chunk at a time (never while an order waits)
       UploadStep();
    ShowStatus();
 }

@@ -428,6 +428,12 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
     if with_brain:
         try:
             sig["brain"] = brain_mod.build_brain(db, user, symbol, sig, scalp_sig, ctx, de, cfg, price, levels, futures, forming_bar, sig["session"])
+            if persist:
+                try:                                                          # early entry from the brain + feed the live trade manager
+                    bridge_mod.on_brain(db, user, symbol, sig["brain"])
+                except Exception:  # noqa: BLE001 - never break the scan
+                    log.exception("early entry failed")
+                    db.rollback()
         except Exception:  # noqa: BLE001 - the brain is advisory; it must never take the live signal down
             log.exception("brain failed")
             sig["brain"] = None

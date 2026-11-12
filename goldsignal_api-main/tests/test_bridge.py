@@ -160,3 +160,68 @@ def test_ea_file_has_token_and_url(env):
     r = c.post("/bridge/ea-file", json={"token": tok, "api_url": "https://api.example.com/"})
     assert r.status_code == 200 and tok in r.text and 'InpApiUrl           = "https://api.example.com"' in r.text and "__TOKEN__" not in r.text
     assert c.post("/bridge/ea-file", json={"token": "gsb_wrong", "api_url": "https://x.y"}).status_code == 400
+
+
+# ------------------------------------------------------------------------------------------------ v2: early entries + live management
+def _brain(direction="BUY", pct=90, score=70, stop=1990.0, target=2020.0, state="armed"):
+    side = {"direction": direction, "state": state, "pct": pct, "brain_score": score, "blockers": [], "counter": False, "in_zone": True,
+            "with_trend": True, "approval": {"state": "forming"}, "stages": [{"key": "trend", "state": "done"}],
+            "plan": {"stop": stop, "target": target}}
+    return {"ts": 1_800_000_000, "step": 900, "atr": 8.0, "sides": {direction: side}, "fundamentals": {}}
+
+
+def _live(price=2000.0):
+    import time as _t
+    from app import live_feed
+    live_feed.reset()
+    live_feed.ingest("XAUUSD=X", [], 0.0, 0.0, {"bid": price - 0.1, "ask": price + 0.1, "spread": 20}, now=_t.time())
+
+
+def test_early_entry_then_signal_confirms_and_tops_up(env):
+    db, u, _ = env
+    bridge.save_config(db, u, {"mode": "auto", "risk_ack": True, "pairs": ["XAUUSD=X"], "early_enabled": True, "risk_pct": 1.0,
+                               "early_risk_factor": 0.5, "max_open_per_pair": 1, "max_open": 5})
+    assert bridge.on_brain(db, u, "XAUUSD=X", _brain()) is None            # no live feed -> no early trade
+    _live(2000.0)
+    e = bridge.on_brain(db, u, "XAUUSD=X", _brain())
+    assert e.kind == "early" and e.status == "queued" and e.risk_pct == 0.5 and round(e.sl_dist) == 10 and round(e.tp_dist) == 20
+    assert bridge.on_brain(db, u, "XAUUSD=X", _brain()) is None            # one early try per candle and direction
+    e.status, e.fill_price, e.sl_now = "open", 2000.0, 1990.0              # the EA filled it
+    db.commit()
+    out = bridge.on_signal(db, u, _sig(db, u, entry=2001, sl=1992, tp=2025))
+    assert out.id == e.id and out.confirmed is True and out.signal_id is not None and out.cmd_sl == 1992      # stop tightened to the signal's
+    top = db.query(models.BridgeOrder).filter(models.BridgeOrder.kind == "topup").one()
+    assert top.risk_pct == 0.5 and top.status == "queued"                  # rest of the risk, despite max_open_per_pair=1
+
+
+def test_poll_applies_positions_trails_stop_and_closes_on_flip(env):
+    db, u, c = env
+    tok = c.post("/bridge/token").json()["token"]
+    H = {"X-Bridge-Token": tok}
+    c.put("/bridge/config", json={"mode": "auto", "risk_ack": True, "pairs": ["XAUUSD=X"]})
+    o = bridge.on_signal(db, u, _sig(db, u))
+    c.post("/bridge/ea/poll", json={}, headers=H)
+    c.post("/bridge/ea/report", json={"id": o.id, "event": "open", "ticket": "7", "price": 2000.0, "lots": 0.1}, headers=H)
+    pos = {"ticket": 7, "id": o.id, "symbol": "XAUUSD", "type": "BUY", "volume": 0.1, "open": 2000.0, "sl": 1990.0, "tp": 2020.0, "price": 2025.0, "profit": 250.0}
+    txt = c.post("/bridge/ea/poll", json={"positions": [pos], "account": {"balance": 1000, "equity": 1250, "profit": 250}}, headers=H).text
+    assert "MODIFY|%d|7|2015" % o.id in txt                                 # peak 2.5R -> lock 1.5R (entry 2000, risk 10)
+    pos2 = {**pos, "sl": 2015.0, "price": 2003.0, "profit": 30.0}          # the terminal shows the new stop: the change is done
+    brain = {"sides": {"SELL": {"direction": "SELL", "state": "ready", "pct": 95}, "BUY": {"state": "building", "pct": 60}}, "_at": 4e9}
+    bridge.BRAIN[(u.id, "XAUUSD=X")] = brain
+    row = db.get(models.BridgeOrder, o.id)
+    row.opened_at = utcnow() - timedelta(minutes=5)
+    row.max_r, row.cmd_sl, row.cmd_tries = 0.2, None, 0                    # pretend the earlier stop change landed and the trade never ran
+    db.commit()
+    txt = c.post("/bridge/ea/poll", json={"positions": [{**pos2, "price": 1997.0, "sl": 1990.0}]}, headers=H).text
+    assert f"CLOSE|{o.id}|7" in txt and "flipped" in db.get(models.BridgeOrder, o.id).manage_note.lower()
+    assert c.get("/bridge").json()["positions"][0]["ticket"] == 7
+
+
+def test_late_signal_is_skipped_on_the_live_price(env):
+    db, u, c = env
+    tok = c.post("/bridge/token").json()["token"]
+    c.put("/bridge/config", json={"mode": "auto", "risk_ack": True, "pairs": ["XAUUSD=X"], "max_drift_r": 0.5})
+    o = bridge.on_signal(db, u, _sig(db, u))                                # entry 2000, stop 10 away
+    _live(2008.0)                                                          # 0.8R toward the target already
+    txt = c.post("/bridge/ea/poll", json={}, headers={"X-Bridge-Token": tok}).text
+    assert "OPEN|" not in txt and db.get(models.BridgeOrder, o.id).status == "skipped" and "chasing" in db.get(models.BridgeOrder, o.id).note

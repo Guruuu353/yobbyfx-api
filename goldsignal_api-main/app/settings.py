@@ -16,7 +16,7 @@ import threading
 _PATH = os.path.join(os.environ.get("GOLDSIGNAL_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."), "settings.json")
 _lock = threading.Lock()
 _state: dict | None = None
-DEFAULTS = {"anchor": "ny_close", "offsets": {}, "offset_set_at": {},
+DEFAULTS = {"anchor": "ny_close", "server_offset": 3.0, "offsets": {}, "offset_set_at": {},
             "news": {"filter": "high", "before": 30, "after": 20},
             "engine": {"amd": "confirm", "quality": "standard", "daily_stop": 2, "smc": "confirm"}}
 
@@ -50,10 +50,19 @@ def anchor() -> str:
         return _load().get("anchor", "ny_close")
 
 
-def set_anchor(value: str) -> None:
+def set_anchor(value: str, offset: float | None = None) -> None:
+    """ny_close = broker on GMT+2/+3 with US DST | utc = GMT+0 | fixed = a constant broker offset (e.g. GMT+3 all year)."""
     with _lock:
-        _load()["anchor"] = "utc" if value == "utc" else "ny_close"
+        st = _load()
+        st["anchor"] = value if value in ("utc", "fixed") else "ny_close"
+        if st["anchor"] == "fixed" and offset is not None:
+            st["server_offset"] = max(-12.0, min(14.0, float(offset)))
         _save()
+
+
+def server_offset() -> float:
+    with _lock:
+        return float(_load().get("server_offset", 3.0))
 
 
 def offset(symbol: str) -> float:

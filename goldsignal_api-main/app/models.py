@@ -228,6 +228,8 @@ class BridgeSetting(Base):
     account_json = Column(Text, nullable=True)
     last_seen = Column(DateTime, nullable=True)           # last EA poll (heartbeat)
     ea_version = Column(String, nullable=True)
+    positions_json = Column(Text, nullable=True)          # v2: every open position of the terminal, as the EA last reported it
+    clock_json = Column(Text, nullable=True)              # v2: broker UTC offset (detected) and VPS clock skew
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow)
 
@@ -269,3 +271,16 @@ class BridgeOrder(Base):
     sent_at = Column(DateTime, nullable=True)
     opened_at = Column(DateTime, nullable=True)
     closed_at = Column(DateTime, nullable=True)
+    # --- v2: early entries from the brain + live management (auto-migrated)
+    kind = Column(String, nullable=True)                  # signal | early | topup
+    confirmed = Column(Boolean, nullable=True)            # early trade: the engine's real signal arrived
+    brain_pct = Column(Float, nullable=True)              # brain readiness when an early trade was placed
+    sl_now = Column(Float, nullable=True)                 # stop / target / price / floating P&L as the EA last reported
+    tp_now = Column(Float, nullable=True)
+    price_now = Column(Float, nullable=True)
+    profit_now = Column(Float, nullable=True)
+    max_r = Column(Float, nullable=True)                  # best excursion in R (drives the trailing stop)
+    cmd_sl = Column(Float, nullable=True)                 # pending stop change for the EA (MODIFY)
+    cmd_tp = Column(Float, nullable=True)
+    cmd_tries = Column(Integer, default=0)
+    manage_note = Column(Text, nullable=True)             # last thing the manager did, and why

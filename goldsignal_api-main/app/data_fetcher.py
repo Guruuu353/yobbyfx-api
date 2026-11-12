@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from . import candle_store, sessions, settings
+from . import candle_store, live_feed, sessions, settings
 
 log = logging.getLogger("goldsignal.data")
 
@@ -378,6 +378,10 @@ def resample_ohlc(df: pd.DataFrame, rule: str, symbol: str = "GC=F") -> pd.DataF
         off = et - utc_naive                       # negative: NY is behind UTC
         shift = pd.Timedelta(hours=7)
         srv = et + shift
+    elif settings.anchor() == "fixed":
+        off = utc_naive - utc_naive                # constant broker offset, no DST (e.g. GMT+3 all year)
+        shift = pd.Timedelta(hours=settings.server_offset())
+        srv = utc_naive + shift
     else:
         off = utc_naive - utc_naive                # zero timedeltas
         shift = pd.Timedelta(0)
@@ -417,7 +421,7 @@ def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
     if interval == "1m" or base.empty:
         return base
     try:
-        m1 = _get_raw(symbol, "1m")
+        m1 = live_feed.overlay(symbol, _get_raw(symbol, "1m"))        # broker candles (MT5 EA) over Yahoo's lagging tape
     except DataUnavailable:
         return base
     if m1.empty:
@@ -439,13 +443,14 @@ def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
 
     df = base.copy()
     newest = tape.index.max()
+    live_on = live_feed.fresh(symbol, 90)
     for ts in tape.index.intersection(df.index):        # extend, never shrink, a candle we already have
         t = tape.loc[ts]
         row = df.loc[ts]
         df.loc[ts, "High"] = max(row["High"], t["High"])
         df.loc[ts, "Low"] = min(row["Low"], t["Low"])
         df.loc[ts, "Volume"] = max(row["Volume"], t["Volume"])
-        if ts == newest:                                 # only the newest bucket's close follows the latest price
+        if ts == newest or live_on:                      # newest bucket follows the latest price (all of them when the MT5 tape is live)
             df.loc[ts, "Close"] = t["Close"]
     new = tape[~tape.index.isin(df.index) & (tape.index > df.index[-1])]
     if len(new):
@@ -562,6 +567,8 @@ def _candles(symbol: str, interval: str, period: str | None, live: bool) -> pd.D
         base = _candles(symbol, "1h", period, live)
         return resample_ohlc(base, interval, symbol)
     df = _get_raw(symbol, YF_INTERVAL[interval], period)
+    if live and interval == "1m":
+        return live_feed.overlay(symbol, df)
     return merge_live(df, interval, symbol) if live else df
 
 
@@ -585,10 +592,14 @@ def get_candles(symbol: str, interval: str = "15m", period: str | None = None, l
 
 def raw_last_price(symbol: str) -> float:
     """Latest Yahoo price WITHOUT the calibration offset (used to calibrate)."""
+    lp = live_feed.last_price(symbol)
+    if lp is not None:
+        return float(lp)
     m1 = _get_raw(symbol, "1m")
     return float(m1["Close"].iloc[-1])
 
 
+LIVE_CLOSE_GRACE = 3  # same, while the MT5 Expert Advisor feeds live candles
 CLOSE_GRACE = 15  # seconds after a bar's end before it counts as closed (lets the last 1m bar arrive)
 
 
@@ -598,7 +609,8 @@ def drop_incomplete(df: pd.DataFrame, interval: str, now: datetime | None = None
         return df
     from .sessions import now_utc
     now = now or now_utc()
-    end = df.index[-1] + timedelta(seconds=INTERVAL_SECONDS[interval] + CLOSE_GRACE)
+    grace = LIVE_CLOSE_GRACE if live_feed.any_fresh() else CLOSE_GRACE      # the broker feed publishes the last tick at once
+    end = df.index[-1] + timedelta(seconds=INTERVAL_SECONDS[interval] + grace)
     return df.iloc[:-1] if now < end else df
 
 
@@ -620,7 +632,7 @@ def data_status(symbol: str, interval: str, df: pd.DataFrame) -> dict:
     now = now_utc()
     lag = None
     try:
-        m1 = _get_raw(symbol, "1m")
+        m1 = live_feed.overlay(symbol, _get_raw(symbol, "1m"))
         if len(m1):
             lag = (now - m1.index[-1].to_pydatetime()).total_seconds() - 60
     except DataUnavailable:
@@ -630,7 +642,7 @@ def data_status(symbol: str, interval: str, df: pd.DataFrame) -> dict:
     mkt = market_open(None, is_futures(symbol))
     stale = bool(not DEMO and mkt and lag is not None and lag > STALE_AFTER)
     return {
-        "source": meta.get("source", "unknown"),
+        "source": "MT5 live (EA)" if live_feed.fresh(symbol) else meta.get("source", "unknown"),
         "last_bar": int(df.index[-1].timestamp()) if len(df) else None,
         "lag_sec": int(max(0, lag)) if lag is not None else None,
         "stale": stale,

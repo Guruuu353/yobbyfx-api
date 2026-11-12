@@ -77,3 +77,31 @@ The server keeps scanning with the browser closed (`bg_scanner.py`), so alerts k
 * The EA was NOT compiled or run against a real MT5 terminal when written. Compile it, fix any message MetaEditor shows, and test on a DEMO account first.
 
 Server settings: `GOLDSIGNAL_JWT_SECRET` (set it on your host; otherwise a random secret is generated into `.jwt_secret` - everyone logs in once again after this upgrade), `GOLDSIGNAL_EXPERT_SECONDS` (30), `GOLDSIGNAL_BRAIN_BARS` (60000).
+
+
+## v12 - live MT5 feed, early entries from the brain, live trade management (EA 2.0)
+
+**Problem this fixes.** Yahoo's tape runs minutes behind, so every candle-close signal arrived late: orders aged out (`max_age_bars`, `expire_min`)
+or were placed after price had gone, and "sent" orders that the EA could not place just sat there until they expired.
+
+* **Live feed (`app/live_feed.py`).** The EA pushes the broker's live quote + last 1m candles (forming bar included) of every allowed pair on each
+  poll (2 s). `data_fetcher` lays them over Yahoo's 1m tape, so every timeframe, the brain and the signal engine run on broker data. Candles are
+  treated as closed 3 s after the bar ends (15 s on Yahoo). If the EA goes quiet, everything falls back to Yahoo by itself.
+* **Early entries (`app/autopilot.py`, Profile -> Expert -> Early entries).** When the brain reads a side as *armed / ready* (price in the 1H zone,
+  trigger candle forming or closed, trend done, no gate closed, readiness >= 80 %, score >= 55) the bridge places a reduced-size trade (default
+  0.5x risk) on the live MT5 price, stop/target from the brain's plan. When the engine's real signal fires, the trade is *confirmed*: stop aligned to the
+  signal (never widened by more than 25 %) and the rest of the risk is added as a top-up order. If the signal never comes the manager closes it
+  (brain readiness fell below 30 %, or N candles passed) - in profit it just goes to break-even.
+* **Trade management on every poll.** Trailing stop (from 1.5R, 1R behind the peak), close when the opposite side turns ready (>= 85 %) while the
+  trade is under +1R, news guard (break-even or close N minutes before a high-impact release), daily loss stop in % of balance. Commands travel to
+  the EA as `MODIFY|id|ticket|sl|tp` and `CLOSE|id|ticket`.
+* **Orders that "do not reflect in MT5".** The EA now keeps a local retry queue (every second until placed or expired) and tells the app *why* it
+  is waiting (spread above limit, Algo Trading off, requote ...); the server re-offers an unconfirmed order after 10 s instead of 90 s and no longer
+  gives up after 5 deliveries. A late signal is skipped on the live price when it has already moved more than `max_drift_r` (default 0.5R) either way.
+* **Account / positions.** The EA reports balance, equity, floating P/L, margin and every open position; they show under *Live from MT5*.
+* **Clock.** The EA reports the terminal's last-tick time; the server compares it with its own UTC clock and derives the broker's real UTC offset
+  (independent of the VPS time zone). The chart's "MT5 server" clock uses it. In `Profile` there is also a fixed "Nairobi (GMT+3)" clock.
+  A new candle anchor `fixed` (constant broker offset, no DST) exists for brokers that are not on New York + 7 h; *Match my MT5 clock* applies it.
+
+Environment: `GOLDSIGNAL_EARLY_SECONDS` (10) how often an early-entry pair's brain is re-read.
+The EA is not compiled here - recompile `GoldSignalBridge.mq5` in MetaEditor and test on a demo account.
