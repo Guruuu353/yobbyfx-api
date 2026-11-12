@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+cache/
+*.db
+settings.json
+vapid_private.pem
+.jwt_secret
+tests/
+.venv/

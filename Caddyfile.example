@@ -1,0 +1,11 @@
+# Caddy gets and renews the https certificate by itself. Point DNS first (A record -> your VPS IP).
+
+# --- Option A: frontend on Vercel, only the backend on this VPS ---
+api.example.com {
+	reverse_proxy api:8000
+}
+
+# --- Option B: everything on this VPS (use docker-compose.yml's "web" service) ---
+# app.example.com {
+# 	reverse_proxy web:80
+# }

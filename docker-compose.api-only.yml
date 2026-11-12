@@ -1,0 +1,24 @@
+# Backend only + automatic https via Caddy. Frontend stays on Vercel.
+#   1. DNS: api.example.com -> this VPS.   2. Edit Caddyfile.example (rename to Caddyfile) with your domain.
+#   3. cp .env.example .env and set GOLDSIGNAL_JWT_SECRET.   4. docker compose -f docker-compose.api-only.yml up -d --build
+services:
+  api:
+    build: ./goldsignal_api-main
+    restart: unless-stopped
+    environment:
+      GOLDSIGNAL_DATA_DIR: /data
+      GOLDSIGNAL_JWT_SECRET: ${GOLDSIGNAL_JWT_SECRET:?set it in .env}
+      GOLDSIGNAL_CORS_ORIGINS: ${GOLDSIGNAL_CORS_ORIGINS:-*}
+    volumes: [goldsignal_data:/data]
+    expose: ["8000"]
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [api]
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+volumes:
+  goldsignal_data:
+  caddy_data:

@@ -1,0 +1,16 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0.35
+pydantic>=2.9
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+# yfinance MUST be recent: the old 0.2.43 pin is what produced
+# "Failed download: JSONDecodeError('Expecting value: line 1 column 1 (char 0)')"
+yfinance>=1.0
+requests>=2.31
+pandas>=2.2
+numpy>=1.26
+python-multipart>=0.0.9
+email-validator>=2.2
+tzdata

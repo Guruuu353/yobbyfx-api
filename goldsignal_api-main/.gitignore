@@ -1,0 +1,12 @@
+cache/
+.venv/
+**/__pycache__/
+__pycache__/
+*.pyc
+*.db
+goldsignal.db
+settings.json
+vapid_private.pem
+.jwt_secret
+vapid_private.pem
+settings.json

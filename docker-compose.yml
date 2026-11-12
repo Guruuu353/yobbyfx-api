@@ -1,0 +1,23 @@
+# docker compose up -d --build        -> app on http://<vps>:8080
+# Put your existing reverse proxy (Traefik / Caddy / nginx proxy manager) in front for https, pointing at service "web" port 80.
+services:
+  api:
+    build: ./goldsignal_api-main
+    restart: unless-stopped
+    environment:
+      GOLDSIGNAL_DATA_DIR: /data
+      GOLDSIGNAL_JWT_SECRET: ${GOLDSIGNAL_JWT_SECRET:?set GOLDSIGNAL_JWT_SECRET in .env (any 32+ random characters)}
+      GOLDSIGNAL_EXPERT_SECONDS: "30"
+      TZ: UTC
+    volumes:
+      - goldsignal_data:/data          # database, candles, settings, push key: survives rebuilds
+    expose:
+      - "8000"
+  web:
+    build: ./goldsignal_ui-main
+    restart: unless-stopped
+    depends_on: [api]
+    ports:
+      - "8080:80"
+volumes:
+  goldsignal_data:
