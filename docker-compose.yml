@@ -1,5 +1,5 @@
 # docker compose up -d --build        -> app on http://<vps>:8080
-# Put your existing reverse proxy (Traefik / Caddy / nginx proxy manager) in front for https, pointing at service "we>
+# Put your existing reverse proxy (Traefik / Caddy / nginx proxy manager) in front for https, pointing at service "web" port 80.
 services:
   api:
     build: ./goldsignal_api-main
@@ -8,7 +8,7 @@ services:
       GOLDSIGNAL_DATA_DIR: /data
       GOLDSIGNAL_JWT_SECRET: ${GOLDSIGNAL_JWT_SECRET:?set GOLDSIGNAL_JWT_SECRET in .env (any 32+ random characters)}
       GOLDSIGNAL_EXPERT_SECONDS: "30"
-      TZ: UTC
+      TZ: UTC          # leave on UTC: the app stores and computes in UTC; the chart clock is drawn in the browser
     volumes:
       - goldsignal_data:/data          # database, candles, settings, push key: survives rebuilds
     expose:
@@ -21,4 +21,3 @@ services:
       - "8080:80"
 volumes:
   goldsignal_data:
-    

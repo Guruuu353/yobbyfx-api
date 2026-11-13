@@ -33,12 +33,12 @@
 //|    InpAllowLiveAccount below AND untick "Demo only" in the app.    |
 //+------------------------------------------------------------------+
 #property copyright "GoldSignal"
-#property version   "2.10"
+#property version   "2.20"
 #property description "GoldSignal MT5 bridge - executes the signals approved in the app"
 
 #include <Trade\Trade.mqh>
 
-#define GS_VERSION "2.1"
+#define GS_VERSION "2.2"
 
 input string InpToken            = "__TOKEN__";     // Bridge token (already filled in by the app)
 input string InpApiUrl           = "__API_URL__";   // Your GoldSignal backend address
@@ -297,6 +297,60 @@ string LiveJson()
                 DoubleToString(r[k].low, digits) + "," + DoubleToString(r[k].close, digits) + "," + IntegerToString((long)r[k].tick_volume) + "]";
       }
       out += "]}";
+      used++;
+   }
+   out += "}";
+   return used > 0 ? out : "";
+}
+
+//+------------------------------------------------------------------+
+//| last closed candles of every timeframe (keeps the app's candle   |
+//| store current from THIS terminal - no dependence on Yahoo)        |
+//+------------------------------------------------------------------+
+ulong g_lastBarsMs = 0;
+
+string BarsJson()
+{
+   string list = CfgGet("pairs", "");
+   if(!InpLiveFeed || list == "")
+      return "";
+   string syms[];
+   int n = StringSplit(list, ',', syms);
+   ENUM_TIMEFRAMES tfs[5] = {PERIOD_M5, PERIOD_M15, PERIOD_M30, PERIOD_H1, PERIOD_D1};
+   string names[5] = {"5m", "15m", "30m", "1h", "1d"};
+   string out = "{";
+   int used = 0;
+   for(int i = 0; i < n; i++)
+   {
+      if(syms[i] == "" || !SymbolSelect(syms[i], true))
+         continue;
+      int digits = (int)SymbolInfoInteger(syms[i], SYMBOL_DIGITS);
+      string one = "";
+      int tfUsed = 0;
+      for(int t = 0; t < 5; t++)
+      {
+         MqlRates r[];
+         int got = CopyRates(syms[i], tfs[t], 1, 3, r);          // shift 1: closed candles only
+         if(got <= 0)
+            continue;
+         if(tfUsed > 0)
+            one += ",";
+         one += "\"" + names[t] + "\":[";
+         for(int k = 0; k < got; k++)
+         {
+            if(k > 0)
+               one += ",";
+            one += "[" + IntegerToString((long)r[k].time) + "," + DoubleToString(r[k].open, digits) + "," + DoubleToString(r[k].high, digits) + "," +
+                   DoubleToString(r[k].low, digits) + "," + DoubleToString(r[k].close, digits) + "," + IntegerToString((long)r[k].tick_volume) + "]";
+         }
+         one += "]";
+         tfUsed++;
+      }
+      if(tfUsed == 0)
+         continue;
+      if(used > 0)
+         out += ",";
+      out += "\"" + JsonEsc(syms[i]) + "\":{" + one + "}";
       used++;
    }
    out += "}";
@@ -896,6 +950,15 @@ void Poll()
    string lj = LiveJson();
    if(lj != "")
       body += ",\"live\":" + lj;
+   if(lj != "" && (g_lastBarsMs == 0 || GetTickCount64() - g_lastBarsMs >= 10000))
+   {
+      string bj = BarsJson();
+      if(bj != "")
+      {
+         body += ",\"bars\":" + bj;
+         g_lastBarsMs = GetTickCount64();
+      }
+   }
    body += "}";
    string resp;
    int code = Post("/bridge/ea/poll", body, resp);
@@ -1000,7 +1063,7 @@ void UploadStep()
    {
       int have = (int)SeriesInfoInteger(sym, tf, SERIES_BARS_COUNT);
       // first time: everything we can; later starts: only the most recent bars (fills any gap)
-      int cap = GlobalVariableCheck(stamp) ? 3000 : InpHistoryBars;
+      int cap = (GlobalVariableCheck(stamp) && TimeCurrent() - (datetime)GlobalVariableGet(stamp) < 2 * 86400) ? 3000 : InpHistoryBars;   // a long pause since the last upload: resend everything to close the gap
       g_hWant = MathMin(have - 2, cap);
       if(g_hWant < 50)
       {

@@ -116,3 +116,11 @@ The EA is not compiled here - recompile `GoldSignalBridge.mq5` in MetaEditor and
 * **Broker offset** is worked out with fallbacks (exact -> +-12 min -> the terminal's own clocks -> last known), and the app tells you when the
   MT5 PC and this server disagree about the time.
 * The EA shows poll count/time/failures and the exact reason for any lock (real account, Algo Trading, EA permission) on the chart.
+
+### v12.2 - the feed no longer depends on Yahoo (EA 2.2)
+Symptom fixed: "Price feed ~39941 min behind (MT5 live (EA)); signals paused". Yahoo was unreachable from the server, the stored candles were
+as old as the EA's last history upload, and the live MT5 quotes were not used for candles.
+* The EA sends the last 3 closed candles of 5m/15m/30m/1h/1d for every allowed pair every 10 s; the server writes them to the candle store.
+* While the EA is live and the store is current, candles come from the store + the live 1m tape - Yahoo is not contacted for that pair.
+* If Yahoo fails, the live tape alone is used (`_m1_live`). Lag is measured on the broker quote while it is live.
+* An EA restart after a long pause (> 2 days) resends the full history to close the gap.

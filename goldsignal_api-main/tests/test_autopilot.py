@@ -124,3 +124,20 @@ def test_status_explains_why_the_feed_is_not_live():
     live_feed.ingest("XAUUSD=X", [[t + 4 * 3600, 1, 2, 0.5, 1, 1]], 0.0, 0.0, {"bid": 1.0, "ask": 1.1}, now=t)   # candles land in the future
     st = live_feed.status("XAUUSD=X")
     assert st["live"] is True and st["rejected"] == 1 and "future" in st["why"]
+
+
+def test_persist_tf_writes_closed_candles_only(tmp_path, monkeypatch=None):
+    import os
+    from app import candle_store
+    os.environ["GOLDSIGNAL_DATA_DIR"] = str(tmp_path)
+    try:
+        candle_store._conn = None  # noqa: SLF001 - fresh store for this test if it caches a connection
+    except Exception:  # noqa: BLE001
+        pass
+    now = 1_800_000_000 - 1_800_000_000 % 900 + 60            # one minute into a 15m candle
+    rows = [[now - 900 * 3 + 7200, 100, 101, 99, 100.5, 5], [now - 900 * 2 + 7200, 100.5, 102, 100, 101, 5],
+            [now - 900 + 7200, 101, 103, 100, 102, 5], [now + 7200 - 60, 102, 104, 101, 103, 5]]   # last one is still forming
+    n = live_feed.persist_tf("TEST=X", "15m", rows, 2.0, 0.5, now=now)
+    assert n == 3
+    st = candle_store.load("TEST=X", "15m")
+    assert len(st) == 3 and abs(st["Close"].iloc[-1] - 101.5) < 1e-9 and st.index[-1] == pd.Timestamp(now - 900, unit="s", tz="UTC")

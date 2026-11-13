@@ -145,6 +145,39 @@ def ingest(symbol: str, rows: list, tz_offset_hours: float, raw_offset: float = 
     return n
 
 
+TF_STEP = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "1d": 86400}
+
+
+def persist_tf(symbol: str, tf: str, rows: list, tz_offset_hours: float, raw_offset: float = 0.0, now: float | None = None) -> int:
+    """The EA sends the last few CLOSED candles of each timeframe straight from the broker; keep them in the candle store so the
+    app's candles stay current with no help from Yahoo. Returns how many rows were written."""
+    from . import candle_store
+    step = TF_STEP.get(tf)
+    if not step or tf not in candle_store.STEP or not rows:
+        return 0
+    now = time.time() if now is None else now
+    out = []
+    for r in rows:
+        try:
+            t = int(float(r[0]) - tz_offset_hours * 3600.0)
+            o, h, l, c = (float(r[i]) - raw_offset for i in (1, 2, 3, 4))
+            v = float(r[5]) if len(r) > 5 else 0.0
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (c > 0 and h >= max(o, c) - 1e-9 and l <= min(o, c) + 1e-9):
+            continue
+        if t + step > now + 60 or t > now + 900:                  # not finished yet / from the future
+            continue
+        out.append((t, o, h, l, c, v))
+    if not out:
+        return 0
+    df = pd.DataFrame(out, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
+    df.index = pd.to_datetime(df.pop("ts"), unit="s", utc=True)
+    df.index.name = "time"
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return candle_store.write_rows(symbol, tf, df)
+
+
 def quote(symbol: str, max_age: float = FRESH_SECONDS, now: float | None = None) -> dict | None:
     now = time.time() if now is None else now
     with _lock:

@@ -41,7 +41,7 @@ log = logging.getLogger("goldsignal.bridge")
 MODES = ("off", "manual", "auto")
 ACTIVE = ("awaiting", "queued", "sent", "open")
 GRADE_RANK = {"C": 0, "B": 1, "A": 2, "A+": 3}
-EA_VERSION = "2.1"
+EA_VERSION = "2.2"
 REDELIVER_SEC = 10          # an order the EA has not confirmed is offered again after this many seconds (it de-duplicates by id)
 ENTRY_TFS = ("1m", "5m", "15m", "30m")
 
@@ -715,7 +715,8 @@ def _stage(uid: int, name: str, db=None):
 
 
 def poll(db, row: models.BridgeSetting, account: dict | None, version: str | None, positions: list | None = None,
-         live: dict | None = None, server_time: float | None = None, gmt_time: float | None = None, ea_err: str | None = None) -> str:
+         live: dict | None = None, server_time: float | None = None, gmt_time: float | None = None, ea_err: str | None = None,
+         bars: dict | None = None) -> str:
     """Heartbeat + work for the EA. Plain text (MQL5 has no JSON parser):
          CFG|key=value|key=value...            settings the EA must follow
          OPEN|id|SYMBOL|BUY/SELL|entry|sl|tp|sl_dist|tp_dist|lots|risk_pct|expires_ts|ttl_seconds
@@ -773,6 +774,14 @@ def poll(db, row: models.BridgeSetting, account: dict | None, version: str | Non
                 stale = dd.get("age") is not None and float(dd["age"]) > 120          # market closed / frozen quote: not "live"
                 n_in += live_feed.ingest(sym, dd.get("m1") or [], off, settings_mod.offset(sym),
                                          None if stale else {"bid": dd.get("bid"), "ask": dd.get("ask"), "spread": dd.get("spread")})
+        n_tf = 0
+        for bsym, by_tf in (bars or {}).items():                  # closed candles per timeframe, straight from the broker
+            sym = app_symbol(cfg, str(bsym))
+            if sym is None or sym not in cfg["pairs"] or off is None or not isinstance(by_tf, dict):
+                continue
+            for tf, rws in by_tf.items():
+                n_tf += live_feed.persist_tf(sym, str(tf), rws or [], off, settings_mod.offset(sym))
+        d["tf_bars_saved"] = n_tf
         d["live_bars_in"] = n_in
         d["live_pairs_sent"] = len(live or {})
         row.clock_json = json.dumps(clk)

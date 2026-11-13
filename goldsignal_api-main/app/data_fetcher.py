@@ -308,6 +308,19 @@ def _get_raw(symbol: str, yf_interval: str, period: str | None = None) -> pd.Dat
             _meta[key] = {"source": "demo", "fetched_at": int(time.time()), "stale": False}
             return df
 
+        # ---- the EA keeps the store current with the broker's own candles: no Yahoo round-trip needed (and none can fail)
+        if yf_interval != "1m" and live_feed.fresh(symbol, 90):
+            b = candle_store.bounds(symbol, yf_interval)
+            if b and time.time() - b[1] <= 3 * candle_store.STEP.get(yf_interval, 900) + 180:
+                try:
+                    df = candle_store.load(symbol, yf_interval, since_ts=int(time.time() - period_days(want) * 86400) if period else None)
+                    if len(df):
+                        _mem[key] = (time.time(), df)
+                        _meta[key] = {"source": "MT5 (EA)", "fetched_at": int(time.time()), "stale": False}
+                        return df
+                except Exception:  # noqa: BLE001 - fall through to the normal path
+                    pass
+
         def _stored(max_days: float | None) -> pd.DataFrame | None:
             try:
                 st = candle_store.load(symbol, yf_interval,
@@ -421,7 +434,7 @@ def merge_live(base: pd.DataFrame, interval: str, symbol: str) -> pd.DataFrame:
     if interval == "1m" or base.empty:
         return base
     try:
-        m1 = live_feed.overlay(symbol, _get_raw(symbol, "1m"))        # broker candles (MT5 EA) over Yahoo's lagging tape
+        m1 = _m1_live(symbol)                                          # broker candles (MT5 EA) over Yahoo's lagging tape
     except DataUnavailable:
         return base
     if m1.empty:
@@ -566,9 +579,9 @@ def _candles(symbol: str, interval: str, period: str | None, live: bool) -> pd.D
     if interval in ("4h", "1d", "1w"):
         base = _candles(symbol, "1h", period, live)
         return resample_ohlc(base, interval, symbol)
-    df = _get_raw(symbol, YF_INTERVAL[interval], period)
     if live and interval == "1m":
-        return live_feed.overlay(symbol, df)
+        return _m1_live(symbol)
+    df = _get_raw(symbol, YF_INTERVAL[interval], period)
     return merge_live(df, interval, symbol) if live else df
 
 
@@ -595,8 +608,7 @@ def raw_last_price(symbol: str) -> float:
     lp = live_feed.last_price(symbol)
     if lp is not None:
         return float(lp)
-    m1 = _get_raw(symbol, "1m")
-    return float(m1["Close"].iloc[-1])
+    return float(_m1_live(symbol)["Close"].iloc[-1])
 
 
 LIVE_CLOSE_GRACE = 3  # same, while the MT5 Expert Advisor feeds live candles
@@ -622,6 +634,19 @@ def get_meta(symbol: str, interval: str) -> dict:
     return {}
 
 
+def _m1_live(symbol: str) -> pd.DataFrame:
+    """The 1-minute tape: Yahoo's (if reachable) with the broker's candles from the EA laid over it. When Yahoo is down the EA's
+    tape alone is used - the live feed must never depend on Yahoo being reachable."""
+    try:
+        raw = _get_raw(symbol, "1m")
+    except DataUnavailable:
+        raw = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"], index=pd.DatetimeIndex([], tz="UTC", name="time"))
+    out = live_feed.overlay(symbol, raw)
+    if out is None or out.empty:
+        raise DataUnavailable(f"Data feed unavailable for {symbol} 1m")
+    return out
+
+
 STALE_AFTER = 12 * 60  # seconds without a new 1m bar (while the market is open) before we call the feed stale
 
 
@@ -632,9 +657,12 @@ def data_status(symbol: str, interval: str, df: pd.DataFrame) -> dict:
     now = now_utc()
     lag = None
     try:
-        m1 = live_feed.overlay(symbol, _get_raw(symbol, "1m"))
+        m1 = _m1_live(symbol)
         if len(m1):
             lag = (now - m1.index[-1].to_pydatetime()).total_seconds() - 60
+            qa = live_feed.age(symbol)
+            if qa is not None and qa <= live_feed.FRESH_SECONDS and lag > 120:
+                lag = qa                                    # the broker quote is live: quiet minutes without a tick are not "lag"
     except DataUnavailable:
         pass
     if lag is None and len(df):
