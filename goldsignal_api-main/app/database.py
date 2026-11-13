@@ -2,7 +2,7 @@
 Database setup. SQLite by default (zero-config). Swap SQLALCHEMY_DATABASE_URL
 for Postgres/MySQL in production without touching the rest of the app.
 """
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 import os
@@ -14,8 +14,23 @@ if DATA_DIR:
 SQLALCHEMY_DATABASE_URL = "sqlite:///" + (os.path.join(DATA_DIR, "goldsignal.db") if DATA_DIR else "./goldsignal.db")
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 30}
 )
+
+
+@event.listens_for(engine, "connect")
+def _sqlite_pragmas(dbapi_conn, _rec):
+    """The scanner thread, the EA's 2-second polls and the web UI all write to the same SQLite file. In the default journal mode a
+    writer blocks everybody and 'database is locked' errors made the EA's polls fail (-> 'EA not connected', balance frozen).
+    WAL lets readers and one writer work together; the busy timeout makes writers wait instead of failing."""
+    try:
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
+    except Exception:  # noqa: BLE001 - not SQLite (Postgres / MySQL): nothing to do
+        pass
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

@@ -41,7 +41,7 @@ log = logging.getLogger("goldsignal.bridge")
 MODES = ("off", "manual", "auto")
 ACTIVE = ("awaiting", "queued", "sent", "open")
 GRADE_RANK = {"C": 0, "B": 1, "A": 2, "A+": 3}
-EA_VERSION = "2.0"
+EA_VERSION = "2.1"
 REDELIVER_SEC = 10          # an order the EA has not confirmed is offered again after this many seconds (it de-duplicates by id)
 ENTRY_TFS = ("1m", "5m", "15m", "30m")
 
@@ -240,6 +240,11 @@ def view(db, user) -> dict:
             acct = None
     seen = _ts(row.last_seen) if row and row.last_seen else None
     now = int(utcnow().replace(tzinfo=timezone.utc).timestamp())
+    mem = HEART.get(user.id) or {}
+    if mem.get("t") and (not seen or mem["t"] > seen):             # the in-memory heartbeat is never behind the database
+        seen = int(mem["t"])
+        if mem.get("account"):
+            acct = mem["account"]
     counts = {}
     for st, in db.query(models.BridgeOrder.status).filter(models.BridgeOrder.user_id == user.id).all():
         counts[st] = counts.get(st, 0) + 1
@@ -253,13 +258,17 @@ def view(db, user) -> dict:
             positions = v or []
         else:
             clk = v or {}
+    if mem.get("positions") is not None and mem.get("t") and now - mem["t"] < 600:
+        positions = mem["positions"]
+    if mem.get("clock"):
+        clk = {**clk, **mem["clock"]}
     feed = {s_: live_feed.status(s_) for s_ in cfg["pairs"]}
     model_off = _model_offset()
     clk = {**clk, "model_offset": model_off, "anchor": settings_mod.anchor(),
            "mismatch": (clk.get("server_offset") is not None and abs(clk["server_offset"] - model_off) > 0.01)}
     return {"config": cfg, "has_token": bool(row and row.token_hash), "token_hint": row.token_hint if row else None,
             "positions": positions, "clock": clk, "feed": feed,
-            "connected": bool(seen and now - seen <= 45), "last_seen": seen, "seen_ago": (now - seen) if seen else None,
+            "connected": bool(seen and now - seen <= 60), "last_seen": seen, "diag": DIAG.get(user.id) or {}, "seen_ago": (now - seen) if seen else None,
             "account": acct, "ea_version": row.ea_version if row else None, "ea_latest": EA_VERSION, "counts": counts,
             "broker_symbols": {s: broker_symbol(cfg, s) for s in cfg["pairs"]},
             "known": {s: broker_symbol(cfg, s) for s in KNOWN}, "now": now}
@@ -274,7 +283,14 @@ def _model_offset(now: float | None = None) -> float:
         return 0.0
     if a == "fixed":
         return float(settings_mod.server_offset())
-    ny = datetime.fromtimestamp(now, ZoneInfo("America/New_York")).utcoffset().total_seconds() / 3600.0
+    try:
+        ny = datetime.fromtimestamp(now, ZoneInfo("America/New_York")).utcoffset().total_seconds() / 3600.0
+    except Exception:  # noqa: BLE001 - no time-zone database on this machine: US rules by hand (2nd Sun Mar -> 1st Sun Nov)
+        d = datetime.fromtimestamp(now, timezone.utc)
+        mar = max(x for x in range(8, 15) if datetime(d.year, 3, x).weekday() == 6)
+        nov = min(x for x in range(1, 8) if datetime(d.year, 11, x).weekday() == 6)
+        dst = datetime(d.year, 3, mar, 7, tzinfo=timezone.utc) <= d < datetime(d.year, 11, nov, 6, tzinfo=timezone.utc)
+        ny = -4.0 if dst else -5.0
     return ny + 7.0
 
 
@@ -665,54 +681,117 @@ def _manage(db, row, cfg: dict) -> None:
                 o.cmd_sl, o.cmd_tries, o.manage_note = a["sl"], 0, a["why"]
 
 
+HEART: dict[int, dict] = {}        # user_id -> what the EA last said, kept IN MEMORY: the UI stays right even if a database write is slow
+DIAG: dict[int, dict] = {}         # user_id -> connection health shown in the app (poll time, last error, feed notes)
+
+
+def _diag(uid: int, **kw) -> dict:
+    d = DIAG.setdefault(uid, {"polls": 0, "errors": 0})
+    d.update(kw)
+    return d
+
+
+def _stage(uid: int, name: str, db=None):
+    """Context for one stage of the poll: an exception is logged, shown in the app and rolled back - it never makes the poll fail."""
+    class _S:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, et, ev, tb):
+            if et is None:
+                return False
+            log.exception("bridge poll stage '%s' failed", name)
+            d = _diag(uid)
+            d["errors"] = d.get("errors", 0) + 1
+            d["last_error"] = f"{name}: {et.__name__}: {str(ev)[:160]}"
+            d["last_error_at"] = time.time()
+            try:
+                if db is not None:
+                    db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+    return _S()
+
+
 def poll(db, row: models.BridgeSetting, account: dict | None, version: str | None, positions: list | None = None,
-         live: dict | None = None, server_time: float | None = None, gmt_time: float | None = None) -> str:
+         live: dict | None = None, server_time: float | None = None, gmt_time: float | None = None, ea_err: str | None = None) -> str:
     """Heartbeat + work for the EA. Plain text (MQL5 has no JSON parser):
          CFG|key=value|key=value...            settings the EA must follow
-         OPEN|id|SYMBOL|BUY/SELL|entry|sl|tp|sl_dist|tp_dist|lots|risk_pct|expires_ts
+         OPEN|id|SYMBOL|BUY/SELL|entry|sl|tp|sl_dist|tp_dist|lots|risk_pct|expires_ts|ttl_seconds
          MODIFY|id|ticket|sl|tp                move the stop / target of an open position (0 = leave)
          CLOSE|id|ticket
     The EA also sends: account, every open position, the live quote + last 1m candles of each allowed pair, the terminal's
-    last-tick time (-> broker clock)."""
+    last-tick time (-> broker clock).
+
+    Built so that it ALWAYS answers: the heartbeat is saved first, every later stage is isolated (see _stage)."""
+    t0 = time.time()
+    uid = row.user_id
     now = utcnow()
-    row.last_seen = now
-    if version:
-        row.ea_version = version[:20]
+    d = _diag(uid)
+    d["polls"] = d.get("polls", 0) + 1
+    d["ea_err"] = ea_err or None
+    keep = None
     if account:
         keep = {k: account.get(k) for k in ("login", "server", "company", "name", "currency", "balance", "equity", "margin", "margin_free",
-                                            "margin_level", "profit", "leverage", "trade_mode", "demo", "build", "terminal_trade_allowed")
+                                            "margin_level", "profit", "leverage", "trade_mode", "demo", "build", "terminal_trade_allowed", "allow_live")
                 if k in account}
-        row.account_json = json.dumps(keep)
+    heart = HEART.setdefault(uid, {})
+    heart["t"] = t0
+    if keep:
+        heart["account"] = keep
     if positions is not None:
-        row.positions_json = json.dumps(positions[:60])
+        heart["positions"] = positions[:60]
+    if version:
+        heart["version"] = version[:20]
+
+    # ---- stage 0: heartbeat. Saved on its own, before anything that could fail.
+    with _stage(uid, "heartbeat", db):
+        row.last_seen = now
+        if version:
+            row.ea_version = version[:20]
+        if keep:
+            row.account_json = json.dumps(keep)
+        if positions is not None:
+            row.positions_json = json.dumps(positions[:60])
+        db.commit()
     cfg = config_of(row)
-    uid = row.user_id
-    # ---- broker clock + live feed
-    clk = live_feed.note_clock(server_time, gmt_time)
-    if clk:
+
+    # ---- stage 1: broker clock + live feed (touches no database rows except the clock note)
+    off = None
+    with _stage(uid, "live feed", db):
+        fb = _model_offset()
+        clk = live_feed.note_clock(server_time, gmt_time, fallback=fb)
+        off = clk.get("server_offset")
+        heart["clock"] = clk
+        n_in = 0
+        if live and off is not None:
+            for bsym, dd in live.items():
+                sym = app_symbol(cfg, str(bsym))
+                if sym is None or sym not in cfg["pairs"]:
+                    continue
+                stale = dd.get("age") is not None and float(dd["age"]) > 120          # market closed / frozen quote: not "live"
+                n_in += live_feed.ingest(sym, dd.get("m1") or [], off, settings_mod.offset(sym),
+                                         None if stale else {"bid": dd.get("bid"), "ask": dd.get("ask"), "spread": dd.get("spread")})
+        d["live_bars_in"] = n_in
+        d["live_pairs_sent"] = len(live or {})
         row.clock_json = json.dumps(clk)
-    off = clk.get("server_offset")
-    if live and off is not None:
-        for bsym, d in live.items():
-            sym = app_symbol(cfg, str(bsym))
-            if sym is None or sym not in cfg["pairs"]:
-                continue
-            stale = d.get("age") is not None and float(d["age"]) > 120          # market closed / frozen quote: not "live"
-            live_feed.ingest(sym, d.get("m1") or [], off, settings_mod.offset(sym),
-                             None if stale else {"bid": d.get("bid"), "ask": d.get("ask"), "spread": d.get("spread")})
-    _apply_positions(db, row, positions or [])
-    q = db.query(models.BridgeOrder).filter(models.BridgeOrder.user_id == uid)
-    for o in q.filter(models.BridgeOrder.status.in_(("awaiting", "queued", "sent")), models.BridgeOrder.expires_at != None,   # noqa: E711
-                      models.BridgeOrder.expires_at < now).all():
-        o.status, o.note = "expired", (o.note if (o.status == "sent" and o.note) else
-                                       "Expired before it reached MT5 - was the EA running?" if o.status != "awaiting" else "Expired: not approved in time")
-    db.flush()                                      # the app's sessions do not autoflush: make the expiries visible to the next query
+
+    # ---- stage 2: positions, expiries, management
+    with _stage(uid, "positions / expiry", db):
+        _apply_positions(db, row, positions or [])
+        q0 = db.query(models.BridgeOrder).filter(models.BridgeOrder.user_id == uid)
+        for o in q0.filter(models.BridgeOrder.status.in_(("awaiting", "queued", "sent")), models.BridgeOrder.expires_at != None,   # noqa: E711
+                           models.BridgeOrder.expires_at < now).all():
+            o.status, o.note = "expired", (o.note if (o.status == "sent" and o.note) else
+                                           "Expired before it reached MT5 - was the EA running?" if o.status != "awaiting" else "Expired: not approved in time")
+        db.commit()
     if cfg["mode"] != "off":
-        try:
+        with _stage(uid, "trade management", db):
             _manage(db, row, cfg)
-        except Exception:  # noqa: BLE001 - management is best effort; the poll must always answer
-            log.exception("trade management failed")
-        db.flush()
+            db.commit()
+
+    # ---- stage 3: what the EA must do
     lines = [("CFG|poll=2|mode={mode}|magic={magic}|lot_mode={lot_mode}|risk_pct={risk_pct}|lots={lots}|max_lots={max_lots}|be_at_r={be_at_r}|"
               "price_mode={price_mode}|max_drift_r={max_drift_r}|max_spread={max_spread}|slippage={slippage}|demo_only={demo}|"
               "comment={comment}|latest={latest}|server_offset={soff}|pairs={pairs}").format(
@@ -721,31 +800,41 @@ def poll(db, row: models.BridgeSetting, account: dict | None, version: str | Non
         max_spread=cfg["max_spread_pts"], slippage=cfg["slippage_pts"], demo=1 if cfg["demo_only"] else 0,
         comment=cfg["comment"].replace("|", " "), latest=EA_VERSION, soff=_f(off if off is not None else 0),
         pairs=",".join(broker_symbol(cfg, x) for x in cfg["pairs"]))]
-    if cfg["mode"] != "off":
-        redeliver = now - timedelta(seconds=REDELIVER_SEC)
-        todo = q.filter(models.BridgeOrder.status.in_(("queued", "sent"))).order_by(models.BridgeOrder.id).limit(20).all()
-        for o in todo:
-            if o.status == "sent" and (o.sent_at is None or o.sent_at > redeliver):
-                continue                                   # the EA already has it (it de-duplicates by id anyway)
-            why = _drift_reason(o, cfg) if (o.status == "queued" and (o.kind or "signal") != "early") else None
-            if why:
-                o.status, o.note = "skipped", why
-                db.add(models.Alert(user_id=uid, kind="bridge", symbol=o.symbol, signal_id=o.signal_id,
-                                    title=f"Skipped - {o.broker_symbol} {o.direction}", message=why))
+    with _stage(uid, "orders", db):
+        q = db.query(models.BridgeOrder).filter(models.BridgeOrder.user_id == uid)
+        out: list[str] = []
+        if cfg["mode"] != "off":
+            redeliver = now - timedelta(seconds=REDELIVER_SEC)
+            todo = q.filter(models.BridgeOrder.status.in_(("queued", "sent"))).order_by(models.BridgeOrder.id).limit(20).all()
+            for o in todo:
+                if o.status == "sent" and (o.sent_at is None or o.sent_at > redeliver):
+                    continue                                   # the EA already has it (it de-duplicates by id anyway)
+                why = None
+                try:
+                    why = _drift_reason(o, cfg) if (o.status == "queued" and (o.kind or "signal") != "early") else None
+                except Exception:  # noqa: BLE001 - a guard must never stop an order
+                    log.exception("drift guard failed")
+                if why:
+                    o.status, o.note = "skipped", why
+                    db.add(models.Alert(user_id=uid, kind="bridge", symbol=o.symbol, signal_id=o.signal_id,
+                                        title=f"Skipped - {o.broker_symbol} {o.direction}", message=why))
+                    continue
+                o.status, o.sent_at, o.delivered = "sent", now, (o.delivered or 0) + 1
+                ttl = max(5, int((o.expires_at - now).total_seconds())) if o.expires_at else 600      # seconds left, so the EA needs no clock
+                out.append("OPEN|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}".format(
+                    o.id, o.broker_symbol, o.direction, _f(o.entry), _f(o.sl), _f(o.tp), _f(o.sl_dist), _f(o.tp_dist), _f(o.lots or 0),
+                    _f(o.risk_pct or 0), _ts(o.expires_at) or 0, ttl))
+        for o in q.filter(models.BridgeOrder.status == "open", models.BridgeOrder.cmd_sl != None).all():       # noqa: E711
+            if (o.cmd_tries or 0) >= 6:
+                o.cmd_sl = o.cmd_tp = None                     # the broker keeps refusing it: stop asking
                 continue
-            o.status, o.sent_at, o.delivered = "sent", now, (o.delivered or 0) + 1
-            lines.append("OPEN|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}".format(
-                o.id, o.broker_symbol, o.direction, _f(o.entry), _f(o.sl), _f(o.tp), _f(o.sl_dist), _f(o.tp_dist), _f(o.lots or 0),
-                _f(o.risk_pct or 0), _ts(o.expires_at) or 0))
-    for o in q.filter(models.BridgeOrder.status == "open", models.BridgeOrder.cmd_sl != None).all():       # noqa: E711
-        if (o.cmd_tries or 0) >= 6:
-            o.cmd_sl = o.cmd_tp = None                     # the broker keeps refusing it: stop asking
-            continue
-        o.cmd_tries = (o.cmd_tries or 0) + 1
-        lines.append(f"MODIFY|{o.id}|{o.ticket or ''}|{_f(o.cmd_sl)}|{_f(o.cmd_tp or 0)}")
-    for o in q.filter(models.BridgeOrder.status.in_(("open", "sent")), models.BridgeOrder.close_requested == True).all():   # noqa: E712
-        lines.append(f"CLOSE|{o.id}|{o.ticket or ''}")
-    db.commit()
+            o.cmd_tries = (o.cmd_tries or 0) + 1
+            out.append(f"MODIFY|{o.id}|{o.ticket or ''}|{_f(o.cmd_sl)}|{_f(o.cmd_tp or 0)}")
+        for o in q.filter(models.BridgeOrder.status.in_(("open", "sent")), models.BridgeOrder.close_requested == True).all():   # noqa: E712
+            out.append(f"CLOSE|{o.id}|{o.ticket or ''}")
+        db.commit()
+        lines += out                                           # only after the commit: a failed save never hands out an order twice
+    d["last_poll_ms"] = int((time.time() - t0) * 1000)
     return "\n".join(lines) + "\n"
 
 

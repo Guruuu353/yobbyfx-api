@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|  GoldSignalBridge.mq5  -  version 2.0                             |
+//|  GoldSignalBridge.mq5  -  version 2.1                             |
 //|  Places the signals from your GoldSignal app in this MT5 terminal |
 //|                                                                    |
 //|  HOW IT WORKS                                                      |
@@ -33,12 +33,12 @@
 //|    InpAllowLiveAccount below AND untick "Demo only" in the app.    |
 //+------------------------------------------------------------------+
 #property copyright "GoldSignal"
-#property version   "2.00"
+#property version   "2.10"
 #property description "GoldSignal MT5 bridge - executes the signals approved in the app"
 
 #include <Trade\Trade.mqh>
 
-#define GS_VERSION "2.0"
+#define GS_VERSION "2.1"
 
 input string InpToken            = "__TOKEN__";     // Bridge token (already filled in by the app)
 input string InpApiUrl           = "__API_URL__";   // Your GoldSignal backend address
@@ -54,6 +54,13 @@ string   g_cfgVals[];
 string   g_pairs[];
 ulong    g_lastPollMs   = 0;
 string   g_status       = "starting";
+string   g_lastErr      = "";           // last connection problem, sent to the app with the next good poll
+int      g_failStreak   = 0;            // consecutive failed polls
+bool     g_pollOk       = false;        // did the last poll succeed? (history uploads wait for a healthy link)
+ulong    g_pollDurMs    = 0;
+long     g_pollCount    = 0;
+ulong    g_pDeadMs[];                   // per waiting order: when it expires, on THIS terminal's monotonic clock (no wall clock involved)
+ulong    g_openDeadMs   = 0;            // set around ExecuteOpen: the deadline of the order being processed
 bool     g_historyBuilt = false;
 
 // history upload state machine (one chunk per timer tick, so polling is never blocked for long)
@@ -116,7 +123,7 @@ string ServerBase()
 }
 
 // POST json to the app. Returns the HTTP status (or -1 when the request could not be sent)
-int Post(string path, string body, string &response)
+int Post(string path, string body, string &response, int timeoutMs = 8000)
 {
    char   data[];
    char   result[];
@@ -126,7 +133,7 @@ int Post(string path, string body, string &response)
    if(len > 0)
       ArrayResize(data, len - 1);        // drop the terminating zero
    ResetLastError();
-   int code = WebRequest("POST", ServerBase() + path, headers, 5000, data, result, resHeaders);
+   int code = WebRequest("POST", ServerBase() + path, headers, timeoutMs, data, result, resHeaders);
    if(code == -1)
    {
       int err = GetLastError();
@@ -164,6 +171,7 @@ string AccountJson()
    s += "\"leverage\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LEVERAGE)) + ",";
    s += "\"trade_mode\":" + IntegerToString((long)AccountInfoInteger(ACCOUNT_TRADE_MODE)) + ",";
    s += "\"demo\":" + (real ? "false" : "true") + ",";
+   s += "\"allow_live\":" + (InpAllowLiveAccount ? "true" : "false") + ",";
    s += "\"build\":" + IntegerToString((long)TerminalInfoInteger(TERMINAL_BUILD)) + ",";
    s += "\"terminal_trade_allowed\":" + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "true" : "false");
    s += "}";
@@ -440,7 +448,12 @@ bool ExecuteOpen(string &p[])
       return true;
    }
 
-   if(expires > 0 && (long)TimeGMT() > expires)
+   bool isExpired = false;
+   if(g_openDeadMs > 0)
+      isExpired = (GetTickCount64() > g_openDeadMs);              // seconds-to-live from the app: independent of this PC's clock / time zone
+   else if(expires > 0)
+      isExpired = ((long)TimeGMT() > expires);                    // old server without ttl
+   if(isExpired)
    {
       Report(id, "skip", 0, 0, 0, 0, "Expired before the EA could place it");
       GlobalVariableSet(doneKey, (double)TimeCurrent());
@@ -666,9 +679,11 @@ int PendFind(long id)
    return -1;
 }
 
-void PendAdd(string line, long id)
+void PendAdd(string line, long id, long ttlSec)
 {
    int n = ArraySize(g_pId);
+   ArrayResize(g_pDeadMs, n + 1);
+   g_pDeadMs[n] = ttlSec > 0 ? GetTickCount64() + (ulong)ttlSec * 1000 : 0;
    ArrayResize(g_pLine, n + 1);
    ArrayResize(g_pId, n + 1);
    ArrayResize(g_pMsg, n + 1);
@@ -688,7 +703,9 @@ void PendRemove(int idx)
       g_pId[i] = g_pId[i + 1];
       g_pMsg[i] = g_pMsg[i + 1];
       g_pLastMs[i] = g_pLastMs[i + 1];
+      g_pDeadMs[i] = g_pDeadMs[i + 1];
    }
+   ArrayResize(g_pDeadMs, n - 1);
    ArrayResize(g_pLine, n - 1);
    ArrayResize(g_pId, n - 1);
    ArrayResize(g_pMsg, n - 1);
@@ -702,7 +719,9 @@ void ProcessPending()
       string p[];
       StringSplit(g_pLine[i], '|', p);
       g_status = "";
+      g_openDeadMs = g_pDeadMs[i];
       bool handled = ExecuteOpen(p);
+      g_openDeadMs = 0;
       if(handled)
       {
          PendRemove(i);
@@ -869,25 +888,37 @@ void BuildHistoryQueue()
 
 void Poll()
 {
+   ulong t0 = GetTickCount64();
    string body = "{\"version\":\"" + GS_VERSION + "\",\"account\":" + AccountJson() + ",\"positions\":" + PositionsJson() +
                  ",\"server_time\":" + IntegerToString((long)TimeCurrent()) + ",\"gmt_time\":" + IntegerToString((long)TimeGMT());
+   if(g_lastErr != "")
+      body += ",\"ea_err\":\"" + JsonEsc(g_lastErr) + "\"";
    string lj = LiveJson();
    if(lj != "")
       body += ",\"live\":" + lj;
    body += "}";
    string resp;
    int code = Post("/bridge/ea/poll", body, resp);
-   if(code == 401)
-   {
-      g_status = "the app rejected the token - download a fresh EA from the Expert card";
-      return;
-   }
+   g_pollDurMs = GetTickCount64() - t0;
+   g_pollCount++;
    if(code != 200)
    {
-      if(code != -1)
-         g_status = "server answered HTTP " + IntegerToString(code);
+      g_failStreak++;
+      g_pollOk = false;
+      string why = (code == 401) ? "the app rejected the token - download a fresh EA from the Expert card"
+                 : (code == -1)  ? g_status
+                 : "server answered HTTP " + IntegerToString(code);
+      g_status = why;
+      g_lastErr = TimeToString(TimeLocal(), TIME_SECONDS) + " " + why + " (" + IntegerToString((long)g_pollDurMs) + " ms)";
+      if(g_failStreak == 1 || g_failStreak % 30 == 0)
+         Print("GoldSignalBridge: poll failed (", g_failStreak, " in a row): ", why);
       return;
    }
+   if(g_failStreak > 0)
+      Print("GoldSignalBridge: connection is back after ", g_failStreak, " failed polls");
+   g_failStreak = 0;
+   g_pollOk = true;
+   g_lastErr = "";
    if(lj != "")
       LiveMarkSynced();
    string lines[];
@@ -938,7 +969,7 @@ void Poll()
       if(GlobalVariableCheck("GSB_DONE_" + IntegerToString(id)))
          continue;
       if(PendFind(id) < 0)
-         PendAdd(openLines[i], id);
+         PendAdd(openLines[i], id, ArraySize(p) > 12 ? StringToInteger(p[12]) : 0);
    }
    ProcessPending();
    for(int i = 0; i < ArraySize(modLines); i++)
@@ -1023,7 +1054,7 @@ void UploadStep()
    }
    b += "]}";
    string resp;
-   int code = Post("/bridge/ea/candles", b, resp);
+   int code = Post("/bridge/ea/candles", b, resp, 30000);      // history chunks are big: give the server time
    if(code == 200)
    {
       g_hOff += got;
@@ -1051,9 +1082,18 @@ void UploadStep()
 void ShowStatus()
 {
    string s = "GoldSignal Bridge " + GS_VERSION + "\n" + g_status;
+   s += "\nPolls " + IntegerToString(g_pollCount) + ", last " + IntegerToString((long)g_pollDurMs) + " ms" + (g_failStreak > 0 ? ", FAILING x" + IntegerToString(g_failStreak) : ", ok");
+   if(g_lastErr != "")
+      s += "\nLast problem: " + g_lastErr;
    s += "\nAccount " + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + (IsRealAccount() ? " (REAL)" : " (demo)");
    if(IsRealAccount() && !InpAllowLiveAccount)
-      s += "\nReal account: trading blocked (InpAllowLiveAccount is off)";
+      s += "\nReal account: trading blocked (InpAllowLiveAccount is off in this EA's inputs)";
+   if(IsRealAccount() && InpAllowLiveAccount && CfgGet("demo_only", "1") == "1")
+      s += "\nReal account: trading blocked (untick 'Demo accounts only' in the app)";
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      s += "\nAlgo Trading is OFF in this terminal (green button)";
+   else if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      s += "\nTrading is not allowed for this EA (tick 'Allow Algo Trading' in the EA's Common tab)";
    Comment(s);
 }
 
@@ -1094,7 +1134,7 @@ void OnTimer()
    ProcessPending();                                    // an order that could not be placed yet is retried every second
    ManageBreakEven();
    CheckClosed();
-   if(now - g_lastPollMs >= 900 && ArraySize(g_pId) == 0)   // history goes out between polls, one chunk at a time (never while an order waits)
+   if(now - g_lastPollMs >= 900 && ArraySize(g_pId) == 0 && g_pollOk)   // history goes out between polls, one chunk at a time (never while an order waits)
       UploadStep();
    ShowStatus();
 }

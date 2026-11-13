@@ -26,7 +26,8 @@ FRESH_SECONDS = 20              # a quote older than this is not "live"
 _lock = threading.RLock()
 _bars: dict[str, dict[int, tuple]] = {}        # symbol -> {open_ts_utc: (o, h, l, c, v)}
 _quote: dict[str, dict] = {}                   # symbol -> {bid, ask, spread, at}
-_clock: dict = {}                              # {"server_offset": h, "skew_sec": s, "at": t}
+_clock: dict = {}                              # {"server_offset": h, "skew_sec": s, "at": t, "source": ...}
+_diag: dict[str, dict] = {}                    # symbol -> what the last batch did (stored / rejected)
 
 
 # ------------------------------------------------------------------------------------------ clock
@@ -45,17 +46,59 @@ def detect_offset(server_time: float | int | None, now: float | None = None) -> 
     return half * 0.5
 
 
-def note_clock(server_time, gmt_time=None, now: float | None = None) -> dict:
+def relaxed_offset(server_time, now: float | None = None, tol: float = 720.0) -> float | None:
+    """Like detect_offset but forgiving (+-12 min): still right when this server's clock drifts a few minutes."""
+    if not server_time:
+        return None
+    now = time.time() if now is None else now
+    diff = float(server_time) - now
+    if abs(diff) > 15 * 3600:
+        return None
+    half = round(diff / 1800.0)
+    return half * 0.5 if abs(diff - half * 1800.0) <= tol else None
+
+
+def ea_clock_offset(server_time, gmt_time) -> float | None:
+    """Offset from the terminal's OWN two clocks (last tick in server time vs TimeGMT): needs no help from this server."""
+    if not server_time or not gmt_time:
+        return None
+    diff = float(server_time) - float(gmt_time)
+    if abs(diff) > 15 * 3600:
+        return None
+    half = round(diff / 1800.0)
+    return half * 0.5 if abs(diff - half * 1800.0) <= 720.0 else None
+
+
+def choose_offset(server_time, gmt_time=None, now: float | None = None, fallback: float | None = None) -> tuple[float | None, str]:
+    """Always try to give the feed a usable broker offset. Order: exact (this server's UTC) -> forgiving -> the terminal's own
+    clocks -> last known / configured. Returns (hours, source). Never blocks the live feed just because the tick was a bit old."""
+    for src, v in (("server-utc", detect_offset(server_time, now)), ("server-utc~", relaxed_offset(server_time, now)),
+                   ("terminal-clock", ea_clock_offset(server_time, gmt_time))):
+        if v is not None:
+            return v, src
+    with _lock:
+        last = _clock.get("server_offset")
+    if last is not None:
+        return float(last), "last-known"
+    if fallback is not None:
+        return float(fallback), "assumed"
+    return None, "unknown"
+
+
+def note_clock(server_time, gmt_time=None, now: float | None = None, fallback: float | None = None) -> dict:
     """Remember the broker offset; also report how wrong the VPS clock is (EA TimeGMT vs this server's UTC)."""
     now = time.time() if now is None else now
-    off = detect_offset(server_time, now)
+    off, src = choose_offset(server_time, gmt_time, now, fallback)
     with _lock:
         if off is not None:
             _clock["server_offset"] = off
-            _clock["at"] = now
+            _clock["source"] = src
+            if src in ("server-utc", "server-utc~", "terminal-clock"):
+                _clock["at"] = now
         if gmt_time:
-            skew = float(gmt_time) - now
-            _clock["skew_sec"] = int(round(skew))
+            _clock["skew_sec"] = int(round(float(gmt_time) - now))          # terminal PC clock minus this server's clock
+            _clock["ea_utc"] = int(float(gmt_time))
+        _clock["server_utc"] = int(now)
         return dict(_clock)
 
 
@@ -70,6 +113,7 @@ def ingest(symbol: str, rows: list, tz_offset_hours: float, raw_offset: float = 
     """rows = [[server_epoch, o, h, l, c, vol], ...] (forming bar included). Returns how many bars were stored."""
     now = time.time() if now is None else now
     n = 0
+    bad = {"future": 0, "broken": 0}
     with _lock:
         d = _bars.setdefault(symbol, {})
         for r in rows or []:
@@ -80,8 +124,10 @@ def ingest(symbol: str, rows: list, tz_offset_hours: float, raw_offset: float = 
             except (TypeError, ValueError, IndexError):
                 continue
             if not (c > 0 and h >= max(o, c) - 1e-9 and l <= min(o, c) + 1e-9):
+                bad["broken"] += 1
                 continue
-            if t > now + 120:                                     # from the future: wrong offset, never store
+            if t > now + 900:                                     # 15 min from the future: wrong clock/offset, never store
+                bad["future"] += 1
                 continue
             t -= t % 60
             d[t] = (o, h, l, c, v)
@@ -95,6 +141,7 @@ def ingest(symbol: str, rows: list, tz_offset_hours: float, raw_offset: float = 
                 _quote[symbol] = {"bid": bid, "ask": ask, "spread": float(quote.get("spread") or 0), "at": now}
             except (KeyError, TypeError, ValueError):
                 pass
+        _diag[symbol] = {"stored": n, "future": bad["future"], "broken": bad["broken"], "at": now}
     return n
 
 
@@ -155,7 +202,16 @@ def status(symbol: str) -> dict:
     a = age(symbol)
     with _lock:
         n = len(_bars.get(symbol) or {})
-    return {"live": a is not None and a <= FRESH_SECONDS, "age_sec": None if a is None else round(a, 1), "bars": n}
+        dg = dict(_diag.get(symbol) or {})
+    why = None
+    if a is None:
+        why = "no quote received from the EA yet"
+    elif a > FRESH_SECONDS:
+        why = f"last quote {int(a)} s ago (EA paused or market closed)"
+    elif dg.get("future"):
+        why = "broker candles rejected: they land in the future - this server's clock or the broker offset is wrong"
+    return {"live": a is not None and a <= FRESH_SECONDS, "age_sec": None if a is None else round(a, 1), "bars": n, "why": why,
+            "rejected": (dg.get("future", 0) + dg.get("broken", 0)) if dg else 0}
 
 
 def reset() -> None:
@@ -163,3 +219,4 @@ def reset() -> None:
         _bars.clear()
         _quote.clear()
         _clock.clear()
+        _diag.clear()

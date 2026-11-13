@@ -99,3 +99,28 @@ if __name__ == "__main__":
         if k.startswith("test_"):
             f()
             print("ok", k)
+
+
+def test_offset_survives_clock_drift_and_old_ticks():
+    live_feed.reset()
+    now = 1_800_000_000
+    # this server's clock is 6 minutes slow: the exact check refuses, the forgiving one still finds GMT+3
+    assert live_feed.detect_offset(now + 3 * 3600 + 360, now) is None
+    assert live_feed.choose_offset(now + 3 * 3600 + 360, None, now) == (3.0, "server-utc~")
+    # the terminal's own clocks (TimeCurrent vs TimeGMT) work even when this server's clock is far off
+    real = now - 900                                                   # this server's clock is 15 min fast; the terminal's PC clock is right
+    assert live_feed.choose_offset(real + 3 * 3600, real, now) == (3.0, "terminal-clock")
+    # nothing usable -> last known, then the assumed offset
+    live_feed.note_clock(now + 2 * 3600 - 3, None, now)
+    assert live_feed.choose_offset(None, None, now) == (2.0, "last-known")
+    live_feed.reset()
+    assert live_feed.choose_offset(None, None, now, fallback=3.0) == (3.0, "assumed")
+
+
+def test_status_explains_why_the_feed_is_not_live():
+    live_feed.reset()
+    assert "no quote received" in live_feed.status("XAUUSD=X")["why"]
+    t = time.time()
+    live_feed.ingest("XAUUSD=X", [[t + 4 * 3600, 1, 2, 0.5, 1, 1]], 0.0, 0.0, {"bid": 1.0, "ask": 1.1}, now=t)   # candles land in the future
+    st = live_feed.status("XAUUSD=X")
+    assert st["live"] is True and st["rejected"] == 1 and "future" in st["why"]

@@ -129,9 +129,37 @@ class PollBody(BaseModel):
     gmt_time: Optional[float] = None             # TimeGMT(): the VPS clock as the terminal sees it
 
 
+def _lenient_json(raw: bytes) -> dict:
+    """The EA's JSON is hand-built in MQL5. Never answer 422 for it: accept odd bytes / nan / inf and keep what is usable."""
+    import json as _json
+    import re as _re
+    txt = raw.decode("utf-8", "replace")
+    for cand in (txt, _re.sub(r"(?<![\w\"])(-?nan|-?inf(?:inity)?)(?![\w\"])", "0", txt, flags=_re.I)):
+        try:
+            v = _json.loads(cand)
+            return v if isinstance(v, dict) else {}
+        except ValueError:
+            continue
+    return {}
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 @router.post("/ea/poll", response_class=PlainTextResponse)
-def ea_poll(body: PollBody, row: models.BridgeSetting = Depends(ea_row), db: Session = Depends(get_db)):
-    return PlainTextResponse(bridge.poll(db, row, body.account, body.version, body.positions, body.live, body.server_time, body.gmt_time))
+async def ea_poll(request: Request, row: models.BridgeSetting = Depends(ea_row), db: Session = Depends(get_db)):
+    from fastapi.concurrency import run_in_threadpool
+    b = _lenient_json(await request.body())
+    acct = b.get("account") if isinstance(b.get("account"), dict) else None
+    pos = [p for p in (b.get("positions") or []) if isinstance(p, dict)] if isinstance(b.get("positions"), list) else None
+    live = b.get("live") if isinstance(b.get("live"), dict) else None
+    txt = await run_in_threadpool(bridge.poll, db, row, acct, (str(b["version"]) if b.get("version") else None), pos, live,
+                                  _num(b.get("server_time")), _num(b.get("gmt_time")), (str(b["ea_err"])[:160] if b.get("ea_err") else None))
+    return PlainTextResponse(txt)
 
 
 class ReportBody(BaseModel):

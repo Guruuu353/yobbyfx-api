@@ -105,3 +105,14 @@ or were placed after price had gone, and "sent" orders that the EA could not pla
 
 Environment: `GOLDSIGNAL_EARLY_SECONDS` (10) how often an early-entry pair's brain is re-read.
 The EA is not compiled here - recompile `GoldSignalBridge.mq5` in MetaEditor and test on a demo account.
+
+### v12.1 - connection hardening (EA 2.1)
+* **The poll can no longer fail half-way.** The heartbeat (last seen, balance, positions) is saved first and kept in memory too; every later stage
+  (live feed, positions, trade management, orders) is isolated, logged and shown under *Link health* in the app. An orders hand-out is only
+  confirmed after its commit. The EA's JSON is parsed leniently (never HTTP 422).
+* **SQLite in WAL mode with a 30 s busy timeout** - the scanner thread, the 2-second EA polls and the UI used to block each other
+  ("database is locked" -> polls failed -> "EA not connected", frozen balance).
+* **Order expiry no longer depends on the MT5 PC's clock/time zone**: the app sends seconds-to-live and the EA counts them on its own monotonic timer.
+* **Broker offset** is worked out with fallbacks (exact -> +-12 min -> the terminal's own clocks -> last known), and the app tells you when the
+  MT5 PC and this server disagree about the time.
+* The EA shows poll count/time/failures and the exact reason for any lock (real account, Algo Trading, EA permission) on the chart.
