@@ -79,6 +79,33 @@ def store_stats(symbol: str = "GC=F", user: models.User = Depends(auth.get_curre
     return {"symbol": symbol, "series": candle_store.stats(symbol)}
 
 
+_TAIL_CACHE: dict = {}
+
+
+@router.get("/tail")
+def tail(symbol: str = "GC=F", interval: TF = "15m", n: int = Query(3, ge=1, le=10),
+         user: models.User = Depends(auth.get_current_user)):
+    """The newest few candles (the forming one included) + the live quote: tiny, so the chart can ask every ~1.5 s and move with the
+    broker's price. The full /candles call (history + structure) stays slow and rare."""
+    from .. import live_feed
+    key, now = (symbol, interval), time.time()
+    hit = _TAIL_CACHE.get(key)
+    if hit and now - hit[0] < 0.6 and hit[1]["n"] >= n:
+        return hit[1]["body"]
+    try:
+        full = get_candles(symbol, interval)
+    except DataUnavailable as e:
+        raise _503(e)
+    df = full.iloc[-n:]
+    times = df.index.as_unit("s").asi8
+    o, h, l, c, v = (df[k].to_numpy(float) for k in ("Open", "High", "Low", "Close", "Volume"))
+    rows = [{"time": int(times[i]), "open": o[i], "high": h[i], "low": l[i], "close": c[i], "volume": v[i]} for i in range(len(df))]
+    body = {"symbol": symbol, "interval": interval, "candles": rows, "live": live_feed.fresh(symbol),
+            "age": live_feed.age(symbol), "server_time": int(now)}
+    _TAIL_CACHE[key] = (now, {"n": n, "body": body})
+    return body
+
+
 _WATCH_CACHE: dict = {}
 
 

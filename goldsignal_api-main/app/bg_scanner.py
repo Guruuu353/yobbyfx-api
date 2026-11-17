@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import timedelta
 
-from . import bridge, models, sessions
+from . import bridge, live_feed, models, sessions
 from .data_fetcher import DataUnavailable, INTERVAL_SECONDS, is_futures
 from .database import SessionLocal
 from .models import utcnow
@@ -54,7 +54,8 @@ def _due(key: tuple, step: int, expert: bool, now: float, early: bool = False) -
         since_close = now % step
         if since_close < FAST_WINDOW:                              # just after a candle close: a trigger may have printed
             new_candle = int(now // step) != int(last // step)
-            return since_close >= 2 and (new_candle or now - last >= FAST_EVERY)   # 2 s grace for the feed to publish the candle
+            live = live_feed.any_fresh()                           # broker candles arrive within ~1-2 s of the close
+            return since_close >= (2 if live else 3) and (new_candle or now - last >= (3 if live else FAST_EVERY))
         return now - last >= (EARLY_SECONDS if early else EXPERT_SECONDS)
     return now - last >= INTERVAL
 
@@ -147,7 +148,7 @@ def _loop() -> None:
         except Exception:  # noqa: BLE001
             STATUS["errors"] += 1
             log.exception("background scanner tick failed")
-        time.sleep(4 if STATUS.get("expert_pairs") else min(INTERVAL, 15))
+        time.sleep((1.5 if live_feed.any_fresh() else 4) if STATUS.get("expert_pairs") else min(INTERVAL, 15))
 
 
 def start() -> None:

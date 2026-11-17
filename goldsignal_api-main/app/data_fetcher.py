@@ -611,7 +611,7 @@ def raw_last_price(symbol: str) -> float:
     return float(_m1_live(symbol)["Close"].iloc[-1])
 
 
-LIVE_CLOSE_GRACE = 3  # same, while the MT5 Expert Advisor feeds live candles
+LIVE_CLOSE_GRACE = 2  # same, while the MT5 Expert Advisor feeds live candles
 CLOSE_GRACE = 15  # seconds after a bar's end before it counts as closed (lets the last 1m bar arrive)
 
 

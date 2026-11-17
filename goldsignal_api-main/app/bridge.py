@@ -41,7 +41,8 @@ log = logging.getLogger("goldsignal.bridge")
 MODES = ("off", "manual", "auto")
 ACTIVE = ("awaiting", "queued", "sent", "open")
 GRADE_RANK = {"C": 0, "B": 1, "A": 2, "A+": 3}
-EA_VERSION = "2.2"
+EA_VERSION = "2.3"
+MAX_PAIRS = 12             # pairs one user can watch / trade at once (every pair is scanned, kept live and fed by the EA)
 REDELIVER_SEC = 10          # an order the EA has not confirmed is offered again after this many seconds (it de-duplicates by id)
 ENTRY_TFS = ("1m", "5m", "15m", "30m")
 
@@ -67,7 +68,7 @@ DEFAULTS: dict = {
     "risk_pct": 0.5, "lots": 0.01, "max_lots": 1.0,
     "max_open": 3, "max_open_per_pair": 1, "daily_loss_r": 3.0,
     # --- execution
-    "expire_min": 10, "be_at_r": 1.0, "price_mode": "relative", "max_drift_r": 0.5, "max_spread_pts": 0, "slippage_pts": 30,
+    "expire_min": 10, "be_at_r": 1.0, "price_mode": "relative", "max_drift_r": 0.5, "max_spread_pts": 0, "slippage_pts": 30, "minlot_x": 1.5,
     "demo_only": True,
     # --- v2 early entries: the brain reads a setup before the candle-close signal -> enter on the live MT5 price
     "early_enabled": False, "early_min_pct": 80, "early_min_brain": 55, "early_risk_factor": 0.5, "early_topup": True,
@@ -100,7 +101,7 @@ def clean_config(raw: dict | None, base: dict | None = None) -> dict:
         if k in raw:
             out[k] = bool(raw[k])
     if "pairs" in raw and isinstance(raw["pairs"], list):
-        out["pairs"] = [s for s in dict.fromkeys(str(x) for x in raw["pairs"]) if s in KNOWN][:30]
+        out["pairs"] = [s for s in dict.fromkeys(str(x) for x in raw["pairs"]) if s in KNOWN][:MAX_PAIRS]
     if raw.get("entry_tf") in ENTRY_TFS:
         out["entry_tf"] = raw["entry_tf"]
     if raw.get("sens") in ("strict", "normal", "high"):
@@ -126,6 +127,7 @@ def clean_config(raw: dict | None, base: dict | None = None) -> dict:
     out["max_drift_r"] = _num(raw.get("max_drift_r", out["max_drift_r"]), 0.05, 3, out["max_drift_r"])
     out["max_spread_pts"] = _num(raw.get("max_spread_pts", out["max_spread_pts"]), 0, 5000, out["max_spread_pts"], int)
     out["slippage_pts"] = _num(raw.get("slippage_pts", out["slippage_pts"]), 0, 1000, out["slippage_pts"], int)
+    out["minlot_x"] = _num(raw.get("minlot_x", out["minlot_x"]), 1, 10, out["minlot_x"])
     if raw.get("news_action") in ("off", "breakeven", "close"):
         out["news_action"] = raw["news_action"]
     for k in ("early_enabled", "early_topup"):
@@ -447,6 +449,11 @@ def on_signal(db, user, rec: models.SignalRecord, age_bars: int = 0, brain: dict
         o.status, o.note = "skipped", why
     elif cfg["mode"] == "auto":
         o.status = "queued"
+        if not ea_online(user.id):                                 # nobody is there to place it: say so now, not after it expired
+            o.note = f"MT5 EA is offline - this order waits {cfg['expire_min']} min for it to reconnect"
+            db.add(models.Alert(user_id=user.id, kind="bridge", symbol=rec.symbol, signal_id=rec.id,
+                                title=f"EA offline - {rec.symbol} {rec.direction} not placed yet",
+                                message="The signal is queued but your MetaTrader Expert Advisor is not connected. Open MT5 and check the EA."))
     else:
         o.status = "awaiting"
         o.note = "Waiting for you: press Send to MT5"
@@ -634,6 +641,7 @@ def _apply_positions(db, row, positions: list) -> None:
         if risk and p.get("open") and p.get("price"):
             r = autopilot.r_now(o.direction, float(p["open"]), float(p["price"]), risk)
             o.max_r = max(o.max_r if o.max_r is not None else r, r)
+        MISS.pop(o.id, None)
         # a pending stop change that the terminal already shows is done
         if o.cmd_sl is not None and o.sl_now is not None and abs(o.sl_now - o.cmd_sl) <= max(1e-6, 0.02 * risk):
             o.cmd_sl, o.cmd_tries = None, 0
@@ -653,6 +661,37 @@ def _drift_reason(o: models.BridgeOrder, cfg: dict) -> str | None:
         return None
     return (f"Price is already {r:+.2f}R from the signal entry (limit {cfg['max_drift_r']:g}R) - "
             + ("chasing, the reward is mostly gone" if r > 0 else "the entry is no longer valid"))
+
+
+MISS: dict[int, int] = {}          # order id -> consecutive polls in which the terminal did not list its position
+
+
+def _reconcile(db, row, positions: list | None) -> None:
+    """MT5 is the truth. An order the app thinks is open but whose position is no longer in the terminal (closed by a stop / target /
+    you, on the phone, ...) is closed here too, even if the EA's own 'closed' report was lost. Needs the full position list."""
+    if positions is None or len(positions) >= 60:
+        return
+    listed = set()
+    for p in positions:
+        try:
+            listed.add(int(p.get("id")))
+        except (TypeError, ValueError):
+            pass
+    for o in db.query(models.BridgeOrder).filter(models.BridgeOrder.user_id == row.user_id, models.BridgeOrder.status == "open").all():
+        if o.id in listed:
+            MISS.pop(o.id, None)
+            continue
+        MISS[o.id] = MISS.get(o.id, 0) + 1
+        opened = _ts(o.opened_at) or 0
+        if MISS[o.id] >= 4 and time.time() - opened > 20:
+            o.status, o.closed_at = "closed", utcnow()
+            o.note = (o.note + " | " if o.note else "") + "Closed in MT5 (position no longer open in the terminal)"
+            MISS.pop(o.id, None)
+
+
+def ea_online(user_id: int, within: float = 20.0) -> bool:
+    t = (HEART.get(user_id) or {}).get("t")
+    return bool(t and time.time() - t <= within)
 
 
 def _manage(db, row, cfg: dict) -> None:
@@ -789,6 +828,7 @@ def poll(db, row: models.BridgeSetting, account: dict | None, version: str | Non
     # ---- stage 2: positions, expiries, management
     with _stage(uid, "positions / expiry", db):
         _apply_positions(db, row, positions or [])
+        _reconcile(db, row, positions)
         q0 = db.query(models.BridgeOrder).filter(models.BridgeOrder.user_id == uid)
         for o in q0.filter(models.BridgeOrder.status.in_(("awaiting", "queued", "sent")), models.BridgeOrder.expires_at != None,   # noqa: E711
                            models.BridgeOrder.expires_at < now).all():
@@ -802,11 +842,11 @@ def poll(db, row: models.BridgeSetting, account: dict | None, version: str | Non
 
     # ---- stage 3: what the EA must do
     lines = [("CFG|poll=2|mode={mode}|magic={magic}|lot_mode={lot_mode}|risk_pct={risk_pct}|lots={lots}|max_lots={max_lots}|be_at_r={be_at_r}|"
-              "price_mode={price_mode}|max_drift_r={max_drift_r}|max_spread={max_spread}|slippage={slippage}|demo_only={demo}|"
+              "price_mode={price_mode}|max_drift_r={max_drift_r}|max_spread={max_spread}|slippage={slippage}|minlot_x={minlot_x}|demo_only={demo}|"
               "comment={comment}|latest={latest}|server_offset={soff}|pairs={pairs}").format(
         mode=cfg["mode"], magic=cfg["magic"], lot_mode=cfg["lot_mode"], risk_pct=_f(cfg["risk_pct"]), lots=_f(cfg["lots"]),
         max_lots=_f(cfg["max_lots"]), be_at_r=_f(cfg["be_at_r"]), price_mode=cfg["price_mode"], max_drift_r=_f(cfg["max_drift_r"]),
-        max_spread=cfg["max_spread_pts"], slippage=cfg["slippage_pts"], demo=1 if cfg["demo_only"] else 0,
+        max_spread=cfg["max_spread_pts"], slippage=cfg["slippage_pts"], minlot_x=_f(cfg["minlot_x"]), demo=1 if cfg["demo_only"] else 0,
         comment=cfg["comment"].replace("|", " "), latest=EA_VERSION, soff=_f(off if off is not None else 0),
         pairs=",".join(broker_symbol(cfg, x) for x in cfg["pairs"]))]
     with _stage(uid, "orders", db):

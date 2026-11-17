@@ -124,3 +124,14 @@ as old as the EA's last history upload, and the live MT5 quotes were not used fo
 * While the EA is live and the store is current, candles come from the store + the live 1m tape - Yahoo is not contacted for that pair.
 * If Yahoo fails, the live tape alone is used (`_m1_live`). Lag is measured on the broker quote while it is live.
 * An EA restart after a long pause (> 2 days) resends the full history to close the gap.
+
+### v12.3 - real-time candles, "My pairs", Signals per pair, order reliability (EA 2.3)
+* **Real-time chart:** `GET /market/tail` (newest 3 candles + forming one, cached 0.6 s) is polled every 1.5 s by the chart and merged in; the full
+  `/market/candles` poll (history + structure) stays slow. Top-bar price every 2 s. The scanner reacts 2 s after a candle close when the EA feed is live
+  (loop 1.5 s), EA poll every 1 s.
+* **My pairs:** ONE list (max 12) = selector = watchlist = server scanner = pairs the Expert may trade (stored in the Expert config). Everything else
+  is not scanned, polled or fed.
+* **Signals:** "All pairs" or one pair (chips, with per-pair W/L/net R).
+* **Orders:** reconcile with MT5 (an order whose position left the terminal is closed in the app within ~4 polls), immediate alert when a signal
+  is queued while the EA is offline, clear reasons (balance 0, smallest lot risk, spread, AutoTrading), account login/server/real-demo shown, new
+  `minlot_x` setting for small accounts.

@@ -33,12 +33,12 @@
 //|    InpAllowLiveAccount below AND untick "Demo only" in the app.    |
 //+------------------------------------------------------------------+
 #property copyright "GoldSignal"
-#property version   "2.20"
+#property version   "2.30"
 #property description "GoldSignal MT5 bridge - executes the signals approved in the app"
 
 #include <Trade\Trade.mqh>
 
-#define GS_VERSION "2.2"
+#define GS_VERSION "2.3"
 
 input string InpToken            = "__TOKEN__";     // Bridge token (already filled in by the app)
 input string InpApiUrl           = "__API_URL__";   // Your GoldSignal backend address
@@ -46,7 +46,7 @@ input bool   InpAllowLiveAccount = false;           // Allow trading on a REAL a
 input bool   InpUploadHistory    = true;            // Send this terminal's candle history to the app (brain learns from it)
 input int    InpHistoryBars      = 30000;           // Candles per pair and timeframe to send the first time
 input bool   InpLiveFeed         = true;            // Push live quotes + 1m candles to the app (kills the data lag)
-input int    InpPollSeconds      = 2;               // How often to talk to the app
+input int    InpPollSeconds      = 1;               // How often to talk to the app
 
 CTrade   g_trade;
 string   g_cfgKeys[];
@@ -599,6 +599,12 @@ bool ExecuteOpen(string &p[])
    double maxLots = CfgNum("max_lots", 1.0);
    if(CfgGet("lot_mode", "risk") == "risk" && riskPct > 0)
    {
+      if(AccountInfoDouble(ACCOUNT_BALANCE) <= 0.0)
+      {
+         g_status = "this terminal reports a balance of 0 (login #" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) +
+                    ", " + AccountInfoString(ACCOUNT_SERVER) + ") - log in to the funded account in MT5";
+         return false;                               // wait: the app shows this reason on the order
+      }
       double budget = AccountInfoDouble(ACCOUNT_BALANCE) * riskPct / 100.0;
       double lpl    = LossPerLot(sym, isBuy, price, sl);
       if(lpl <= 0)
@@ -609,9 +615,10 @@ bool ExecuteOpen(string &p[])
       }
       lots = budget / lpl;
       double vmin = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-      if(lots < vmin && vmin * lpl > budget * 1.5)
+      double minX = CfgNum("minlot_x", 1.5);
+      if(lots < vmin && vmin * lpl > budget * minX)
       {
-         Report(id, "skip", 0, 0, 0, 0, "Smallest lot (" + DoubleToString(vmin, 2) + ") would risk more than 1.5x your " + DoubleToString(riskPct, 2) + "% budget. Raise the risk % or use a bigger account.");
+         Report(id, "skip", 0, 0, 0, 0, "Smallest lot (" + DoubleToString(vmin, 2) + ") would risk " + DoubleToString(vmin * lpl, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY) + ", more than " + DoubleToString(minX, 1) + "x your " + DoubleToString(riskPct, 2) + "% budget (" + DoubleToString(budget, 2) + "). Raise the risk % / the allowed multiple, or use fixed lots.");
          GlobalVariableSet(doneKey, (double)TimeCurrent());
          return true;
       }
