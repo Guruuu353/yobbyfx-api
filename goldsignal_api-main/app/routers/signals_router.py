@@ -336,6 +336,9 @@ def run_scan(db: Session, user: models.User, symbol: str = "GC=F", entry_interva
     """One full evaluation of a pair. Called by the page (/signals/live) and by the background scanner.
     with_brain adds sig["brain"] (readiness %, approval, quick shifts, pattern memory - read-only, see brain.py).
     Raises DataUnavailable when the feed is down."""
+    mine = bridge_mod.my_pairs(db, user.id)
+    if mine and symbol not in mine:                      # a pair outside "My pairs" can be looked at, but never creates signals, alerts or orders
+        persist = track = log_scan = False
     if persist and not with_brain:
         try:
             with_brain = bridge_mod.wants_brain(db, user.id)       # the MT5 bridge has a minimum brain score set: it needs the read
@@ -790,6 +793,9 @@ def board(
     """What every pair is doing right now, read from the scanner's latest evaluation (cheap: no market data calls).
     Opening this also tells the background scanner the pairs are still wanted, so they stay fresh."""
     syms = [x for x in dict.fromkeys(symbols.split(",")) if x][:40]
+    mine = bridge_mod.my_pairs(db, user.id)
+    if mine:
+        syms = [x for x in syms if x in mine]
     now = utcnow()
     db.query(models.ScanState).filter(models.ScanState.user_id == user.id, models.ScanState.symbol.in_(syms),
                                       models.ScanState.entry_interval == entry_interval).update(
@@ -855,6 +861,10 @@ def activity(
     q = db.query(models.ScanLog).filter(models.ScanLog.user_id == user.id, models.ScanLog.ts >= utcnow() - timedelta(hours=hours))
     if symbol:
         q = q.filter(models.ScanLog.symbol == symbol)
+    else:
+        mine = bridge_mod.my_pairs(db, user.id)
+        if mine:
+            q = q.filter(models.ScanLog.symbol.in_(mine))
     rows = q.order_by(models.ScanLog.symbol, models.ScanLog.entry_interval, models.ScanLog.ts).limit(12000).all()
     out, prev = [], {}
     for r in rows:
@@ -927,6 +937,10 @@ def history(
         q = q.filter(models.SignalRecord.status == status_filter)
     if symbol:
         q = q.filter(models.SignalRecord.symbol == symbol)
+    else:
+        mine = bridge_mod.my_pairs(db, user.id)
+        if mine:
+            q = q.filter(models.SignalRecord.symbol.in_(mine))
     return q.order_by(desc(models.SignalRecord.created_at)).limit(300).all()
 
 

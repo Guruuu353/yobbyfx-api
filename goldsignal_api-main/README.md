@@ -135,3 +135,12 @@ as old as the EA's last history upload, and the live MT5 quotes were not used fo
 * **Orders:** reconcile with MT5 (an order whose position left the terminal is closed in the app within ~4 polls), immediate alert when a signal
   is queued while the EA is offline, clear reasons (balance 0, smallest lot risk, spread, AutoTrading), account login/server/real-demo shown, new
   `minlot_x` setting for small accounts.
+
+### v12.4 - steady EA polling, exact trade-block reasons, everything limited to My pairs (EA 2.4)
+* **EA scheduler:** 250 ms timer; the poll is due every second and always goes first. History goes out in 400-row chunks only after a fast, healthy
+  poll, with no order waiting, and the pause between chunks grows when a chunk is slow. Default history 10 000 bars/TF. Progress is shown in the app.
+* **"Trading is not allowed"** is now split: not connected / Algo Trading button / EA permission / READ-ONLY account (investor password) / broker forbids
+  EAs. The EA sends the flags; the app shows a checklist and each pending order carries the exact reason.
+* **A quote counts as live for 45 s** (was 20): short EA hiccups no longer flip the app to Yahoo's delayed feed.
+* **My pairs everywhere (server enforced):** scanner, `/signals/live` (other pairs can be viewed but never persist signals / alerts / orders), board,
+  history, activity, alerts + unseen count, profile stats, Expert. With no list chosen yet there is no restriction.

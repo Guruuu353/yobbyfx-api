@@ -74,6 +74,8 @@ def _targets(db) -> list[dict]:
         out[key] = {"user_id": r.user_id, "symbol": r.symbol, "entry_tf": r.entry_interval, "min_agreement": float(p.get("min_agreement", 70)),
                     "rr": float(p.get("rr", 2.0)), "sens": p.get("sens", "normal"), "scalp": bool(p.get("scalp", False)),
                     "sessions_only": bool(p.get("sessions_only", True)), "expert": False}
+    mine = bridge.my_pairs_map(db)                                   # only the pairs each user chose: nothing else is scanned for them
+    out = {k: v for k, v in out.items() if v["expert"] or v["user_id"] not in mine or v["symbol"] in mine[v["user_id"]]}
     return sorted(out.values(), key=lambda x: (not x["expert"], x["user_id"], x["symbol"]))
 
 

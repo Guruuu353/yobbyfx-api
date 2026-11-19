@@ -2,10 +2,10 @@ from typing import List
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import desc
+from sqlalchemy import desc, or_
 from sqlalchemy.orm import Session
 
-from .. import auth, models, schemas
+from .. import auth, bridge, models, schemas
 from ..database import get_db
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
@@ -19,13 +19,15 @@ def list_alerts(
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
 ):
-    q = db.query(models.Alert).filter(models.Alert.user_id == user.id)
+    mine = bridge.my_pairs(db, user.id)
+    scope = [or_(models.Alert.symbol.in_(mine), models.Alert.symbol == None)] if mine else []       # noqa: E711  (system alerts have no pair)
+    q = db.query(models.Alert).filter(models.Alert.user_id == user.id, *scope)
     if unseen_only:
         q = q.filter(models.Alert.seen == False)  # noqa: E712
     if after_id:
         q = q.filter(models.Alert.id > after_id)
     rows = q.order_by(desc(models.Alert.id)).limit(limit).all()
-    unseen = db.query(models.Alert).filter(models.Alert.user_id == user.id, models.Alert.seen == False).count()  # noqa: E712
+    unseen = db.query(models.Alert).filter(models.Alert.user_id == user.id, models.Alert.seen == False, *scope).count()  # noqa: E712
     return {"alerts": [schemas.AlertOut.model_validate(r).model_dump(mode="json") for r in rows], "unseen": unseen}
 
 

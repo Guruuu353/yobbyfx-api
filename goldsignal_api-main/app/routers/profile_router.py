@@ -9,7 +9,12 @@ router = APIRouter(prefix="/profile", tags=["profile"])
 
 @router.get("/me", response_model=schemas.ProfileStats)
 def me(db: Session = Depends(get_db), user: models.User = Depends(auth.get_current_user)):
-    signals = db.query(models.SignalRecord).filter(models.SignalRecord.user_id == user.id).all()
+    from .. import bridge
+    q = db.query(models.SignalRecord).filter(models.SignalRecord.user_id == user.id)
+    mine = bridge.my_pairs(db, user.id)
+    if mine:
+        q = q.filter(models.SignalRecord.symbol.in_(mine))
+    signals = q.all()
     won = sum(1 for s in signals if s.status == "won")
     lost = sum(1 for s in signals if s.status == "lost")
     open_ = sum(1 for s in signals if s.status == "open")

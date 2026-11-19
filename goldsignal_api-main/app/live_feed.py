@@ -22,7 +22,7 @@ import time
 import pandas as pd
 
 MAX_BARS = 2000                 # per symbol (~33 hours of 1m)
-FRESH_SECONDS = 20              # a quote older than this is not "live"
+FRESH_SECONDS = 45              # a quote older than this is not "live" (rides over short EA hiccups instead of flipping to Yahoo)
 _lock = threading.RLock()
 _bars: dict[str, dict[int, tuple]] = {}        # symbol -> {open_ts_utc: (o, h, l, c, v)}
 _quote: dict[str, dict] = {}                   # symbol -> {bid, ask, spread, at}

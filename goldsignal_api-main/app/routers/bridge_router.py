@@ -159,7 +159,7 @@ async def ea_poll(request: Request, row: models.BridgeSetting = Depends(ea_row),
     live = b.get("live") if isinstance(b.get("live"), dict) else None
     txt = await run_in_threadpool(bridge.poll, db, row, acct, (str(b["version"]) if b.get("version") else None), pos, live,
                                   _num(b.get("server_time")), _num(b.get("gmt_time")), (str(b["ea_err"])[:160] if b.get("ea_err") else None),
-                                  b.get("bars") if isinstance(b.get("bars"), dict) else None)
+                                  b.get("bars") if isinstance(b.get("bars"), dict) else None, (str(b["hist"])[:20] if b.get("hist") else None))
     return PlainTextResponse(txt)
 
 

@@ -33,18 +33,18 @@
 //|    InpAllowLiveAccount below AND untick "Demo only" in the app.    |
 //+------------------------------------------------------------------+
 #property copyright "GoldSignal"
-#property version   "2.30"
+#property version   "2.40"
 #property description "GoldSignal MT5 bridge - executes the signals approved in the app"
 
 #include <Trade\Trade.mqh>
 
-#define GS_VERSION "2.3"
+#define GS_VERSION "2.4"
 
 input string InpToken            = "__TOKEN__";     // Bridge token (already filled in by the app)
 input string InpApiUrl           = "__API_URL__";   // Your GoldSignal backend address
 input bool   InpAllowLiveAccount = false;           // Allow trading on a REAL account (default: demo only)
 input bool   InpUploadHistory    = true;            // Send this terminal's candle history to the app (brain learns from it)
-input int    InpHistoryBars      = 30000;           // Candles per pair and timeframe to send the first time
+input int    InpHistoryBars      = 10000;           // Candles per pair and timeframe to send the first time
 input bool   InpLiveFeed         = true;            // Push live quotes + 1m candles to the app (kills the data lag)
 input int    InpPollSeconds      = 1;               // How often to talk to the app
 
@@ -173,7 +173,11 @@ string AccountJson()
    s += "\"demo\":" + (real ? "false" : "true") + ",";
    s += "\"allow_live\":" + (InpAllowLiveAccount ? "true" : "false") + ",";
    s += "\"build\":" + IntegerToString((long)TerminalInfoInteger(TERMINAL_BUILD)) + ",";
-   s += "\"terminal_trade_allowed\":" + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "true" : "false");
+   s += "\"terminal_trade_allowed\":" + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "true" : "false") + ",";
+   s += "\"mql_trade_allowed\":" + (MQLInfoInteger(MQL_TRADE_ALLOWED) ? "true" : "false") + ",";
+   s += "\"account_trade_allowed\":" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "true" : "false") + ",";
+   s += "\"trade_expert\":" + (AccountInfoInteger(ACCOUNT_TRADE_EXPERT) ? "true" : "false") + ",";
+   s += "\"connected\":" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "true" : "false");
    s += "}";
    return s;
 }
@@ -470,6 +474,22 @@ double LossPerLot(string sym, bool isBuy, double price, double sl)
 //| open an order from the app.  Returns true = handled (do not       |
 //| fetch again), false = try again on a later poll                   |
 //+------------------------------------------------------------------+
+// Why can this EA not place a trade right now? "" = it can. Each reason names the exact switch to fix.
+string TradeBlockReason()
+{
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+      return "MT5 is not connected to the broker (bottom-right of the terminal shows 'No connection')";
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return "the Algo Trading button in the MT5 toolbar is OFF (press it so it turns green)";
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return "this EA is not allowed to trade: remove it from the chart, drag it on again and tick 'Allow Algo Trading' in the Common tab";
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return "this account is READ-ONLY: you are logged in with the INVESTOR password (or the broker disabled trading). In MT5: File > Login to Trade Account, use the MASTER (trading) password";
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))
+      return "your broker does not allow Expert Advisors on this account type";
+   return "";
+}
+
 bool ExecuteOpen(string &p[])
 {
    // OPEN|id|SYMBOL|BUY/SELL|entry|sl|tp|sl_dist|tp_dist|lots|risk_pct|expires_ts
@@ -522,10 +542,11 @@ bool ExecuteOpen(string &p[])
       GlobalVariableSet(doneKey, (double)TimeCurrent());
       return true;
    }
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   string block = TradeBlockReason();
+   if(block != "")
    {
-      g_status = "trading is not allowed: press the Algo Trading button";
-      return false;                                  // retry later (until the order expires)
+      g_status = "cannot trade: " + block;
+      return false;                                  // retry later (until the order expires); the app shows this reason on the order
    }
 
    if(!SymbolSelect(sym, true))
@@ -954,6 +975,8 @@ void Poll()
                  ",\"server_time\":" + IntegerToString((long)TimeCurrent()) + ",\"gmt_time\":" + IntegerToString((long)TimeGMT());
    if(g_lastErr != "")
       body += ",\"ea_err\":\"" + JsonEsc(g_lastErr) + "\"";
+   if(InpUploadHistory && g_historyBuilt && ArraySize(g_hSym) > 0)
+      body += ",\"hist\":\"" + (g_hIdx >= ArraySize(g_hSym) ? "done" : IntegerToString(g_hIdx) + "/" + IntegerToString(ArraySize(g_hSym))) + "\"";
    string lj = LiveJson();
    if(lj != "")
       body += ",\"live\":" + lj;
@@ -1083,7 +1106,7 @@ void UploadStep()
          return;
       }
    }
-   int chunk = 1000;
+   int chunk = 400;                               // small chunks: one call never keeps the EA away from its polling for long
    if(g_hOff + chunk > g_hWant)
       chunk = g_hWant - g_hOff;
    if(chunk <= 0)
@@ -1160,10 +1183,9 @@ void ShowStatus()
       s += "\nReal account: trading blocked (InpAllowLiveAccount is off in this EA's inputs)";
    if(IsRealAccount() && InpAllowLiveAccount && CfgGet("demo_only", "1") == "1")
       s += "\nReal account: trading blocked (untick 'Demo accounts only' in the app)";
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
-      s += "\nAlgo Trading is OFF in this terminal (green button)";
-   else if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-      s += "\nTrading is not allowed for this EA (tick 'Allow Algo Trading' in the EA's Common tab)";
+   string blk = TradeBlockReason();
+   if(blk != "")
+      s += "\nTRADING BLOCKED: " + blk;
    Comment(s);
 }
 
@@ -1180,7 +1202,7 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
    TrackReload();
-   EventSetTimer(1);
+   EventSetMillisecondTimer(250);
    g_status = "starting";
    ShowStatus();
    Print("GoldSignalBridge ", GS_VERSION, " started. Server ", ServerBase(), ". Remember: add that address under Tools > Options > Expert Advisors > Allow WebRequest.");
@@ -1193,20 +1215,39 @@ void OnDeinit(const int reason)
    Comment("");
 }
 
+ulong g_lastUploadMs = 0;
+ulong g_uploadGapMs  = 4000;           // pause between history chunks; grows when a chunk was slow, so polling is never starved
+ulong g_lastHouseMs  = 0;
+
 void OnTimer()
 {
    ulong now = GetTickCount64();
+   bool polled = false;
    if(now - g_lastPollMs >= (ulong)MathMax(1, InpPollSeconds) * 1000)
    {
       g_lastPollMs = now;
       Poll();
+      polled = true;
    }
-   ProcessPending();                                    // an order that could not be placed yet is retried every second
-   ManageBreakEven();
-   CheckClosed();
-   if(now - g_lastPollMs >= 900 && ArraySize(g_pId) == 0 && g_pollOk)   // history goes out between polls, one chunk at a time (never while an order waits)
+   if(now - g_lastHouseMs >= 1000)                      // housekeeping once a second
+   {
+      g_lastHouseMs = now;
+      ProcessPending();                                 // an order that could not be placed yet is retried every second
+      ManageBreakEven();
+      CheckClosed();
+      ShowStatus();
+   }
+   // History goes out in small chunks, only when: the last poll was healthy and fast, no order is waiting, and enough time has passed.
+   // A slow chunk lengthens the pause, so the live feed and the orders always come first.
+   if(!polled && g_pollOk && g_pollDurMs < 1500 && ArraySize(g_pId) == 0 && now - g_lastUploadMs >= g_uploadGapMs &&
+      now - g_lastPollMs >= 250 && now - g_lastPollMs <= (ulong)MathMax(1, InpPollSeconds) * 1000 - 500)
+   {
+      ulong t0 = GetTickCount64();
       UploadStep();
-   ShowStatus();
+      ulong dur = GetTickCount64() - t0;
+      g_lastUploadMs = GetTickCount64();
+      g_uploadGapMs = dur > 800 ? (ulong)MathMin(60000, MathMax(4000, (long)dur * 8)) : 4000;
+   }
 }
 
 void OnTick()

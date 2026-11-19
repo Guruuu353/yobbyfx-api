@@ -41,7 +41,7 @@ log = logging.getLogger("goldsignal.bridge")
 MODES = ("off", "manual", "auto")
 ACTIVE = ("awaiting", "queued", "sent", "open")
 GRADE_RANK = {"C": 0, "B": 1, "A": 2, "A+": 3}
-EA_VERSION = "2.3"
+EA_VERSION = "2.4"
 MAX_PAIRS = 12             # pairs one user can watch / trade at once (every pair is scanned, kept live and fed by the EA)
 REDELIVER_SEC = 10          # an order the EA has not confirmed is offered again after this many seconds (it de-duplicates by id)
 ENTRY_TFS = ("1m", "5m", "15m", "30m")
@@ -689,6 +689,28 @@ def _reconcile(db, row, positions: list | None) -> None:
             MISS.pop(o.id, None)
 
 
+def my_pairs(db, user_id: int) -> list[str] | None:
+    """The user's chosen pairs (None = no list chosen yet = no restriction). EVERYTHING - the scanner, signals, alerts, stats, the board and
+    the Expert - works on this one list."""
+    row = get_row(db, user_id)
+    if row is None:
+        return None
+    p = config_of(row)["pairs"]
+    return list(p) if p else None
+
+
+def my_pairs_map(db) -> dict[int, set]:
+    out: dict[int, set] = {}
+    for row in db.query(models.BridgeSetting).all():
+        try:
+            p = config_of(row)["pairs"]
+        except Exception:  # noqa: BLE001
+            continue
+        if p:
+            out[row.user_id] = set(p)
+    return out
+
+
 def ea_online(user_id: int, within: float = 20.0) -> bool:
     t = (HEART.get(user_id) or {}).get("t")
     return bool(t and time.time() - t <= within)
@@ -755,7 +777,7 @@ def _stage(uid: int, name: str, db=None):
 
 def poll(db, row: models.BridgeSetting, account: dict | None, version: str | None, positions: list | None = None,
          live: dict | None = None, server_time: float | None = None, gmt_time: float | None = None, ea_err: str | None = None,
-         bars: dict | None = None) -> str:
+         bars: dict | None = None, hist: str | None = None) -> str:
     """Heartbeat + work for the EA. Plain text (MQL5 has no JSON parser):
          CFG|key=value|key=value...            settings the EA must follow
          OPEN|id|SYMBOL|BUY/SELL|entry|sl|tp|sl_dist|tp_dist|lots|risk_pct|expires_ts|ttl_seconds
@@ -771,10 +793,12 @@ def poll(db, row: models.BridgeSetting, account: dict | None, version: str | Non
     d = _diag(uid)
     d["polls"] = d.get("polls", 0) + 1
     d["ea_err"] = ea_err or None
+    d["hist"] = hist or None                                      # "done" or "n/total": history upload progress shown in the app
     keep = None
     if account:
         keep = {k: account.get(k) for k in ("login", "server", "company", "name", "currency", "balance", "equity", "margin", "margin_free",
-                                            "margin_level", "profit", "leverage", "trade_mode", "demo", "build", "terminal_trade_allowed", "allow_live")
+                                            "margin_level", "profit", "leverage", "trade_mode", "demo", "build", "terminal_trade_allowed", "allow_live",
+                                            "mql_trade_allowed", "account_trade_allowed", "trade_expert", "connected")
                 if k in account}
     heart = HEART.setdefault(uid, {})
     heart["t"] = t0
